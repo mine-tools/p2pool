@@ -346,6 +346,11 @@ bool TCPServer::connect_to_peer(const std::string& domain, int port)
 
 bool TCPServer::is_banned(bool is_v6, raw_ip ip)
 {
+	// Ban functionality disabled - always return false
+	return false;
+	
+	// Original code (disabled):
+	/*
 	if (ip.is_localhost()) {
 		return false;
 	}
@@ -369,6 +374,7 @@ bool TCPServer::is_banned(bool is_v6, raw_ip ip)
 	}
 
 	return false;
+	*/
 }
 
 bool TCPServer::connect_to_peer(Client* client)
@@ -541,6 +547,11 @@ void TCPServer::print_status()
 
 void TCPServer::ban(bool is_v6, raw_ip ip, uint64_t seconds)
 {
+	// Ban functionality disabled - do nothing
+	return;
+	
+	// Original code (disabled):
+	/*
 	if (ip.is_localhost()) {
 		return;
 	}
@@ -554,6 +565,7 @@ void TCPServer::ban(bool is_v6, raw_ip ip, uint64_t seconds)
 
 	MutexLock lock(m_bansLock);
 	m_bans[ip] = ban_time;
+	*/
 }
 
 void TCPServer::print_bans()
@@ -1351,6 +1363,11 @@ void TCPServer::Client::close()
 
 void TCPServer::Client::ban(uint64_t seconds)
 {
+	// Ban functionality disabled - do nothing
+	return;
+	
+	// Original code (disabled):
+	/*
 	if (m_addr.is_localhost()) {
 		return;
 	}
@@ -1359,6 +1376,7 @@ void TCPServer::Client::ban(uint64_t seconds)
 		LOGWARN(3, "peer " << static_cast<char*>(m_addrString) << " banned for " << seconds << " seconds");
 		m_owner->ban(isV6(), m_addr, seconds);
 	}
+	*/
 }
 
 void TCPServer::Client::init_addr_string()

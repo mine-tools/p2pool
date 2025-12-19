@@ -28,7 +28,7 @@
 
 LOG_CATEGORY(StratumServer)
 
-static constexpr int DEFAULT_BACKLOG = 128;
+static constexpr int DEFAULT_BACKLOG = 1024;  // Increased from 128 to 1024 for better handling of many connections
 static constexpr uint64_t MIN_DIFF = 1000;
 static constexpr uint64_t AUTO_DIFF_TARGET_TIME = 30;
 
@@ -792,7 +792,8 @@ void StratumServer::on_blobs_ready()
 			// Not logged in yet, on_login() will send the job to this client. Also close inactive connections.
 			if (cur_time >= client->m_connectedTime + 10) {
 				LOGWARN(4, "client " << static_cast<char*>(client->m_addrString) << " didn't send login data");
-				client->ban(m_banTime);
+				// Ban functionality disabled
+				// client->ban(m_banTime);
 				client->close();
 			}
 			continue;
@@ -1117,8 +1118,9 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 
 		client->m_score += share->m_score;
 
+		// Ban functionality disabled - only close connection without banning
 		if (bad_share && (client->m_score <= BAN_THRESHOLD_POINTS)) {
-			client->ban(server->m_banTime);
+			// client->ban(server->m_banTime);  // Disabled
 			client->close();
 		}
 		else if (!result) {
@@ -1126,7 +1128,8 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 		}
 	}
 	else if (bad_share) {
-		server->ban(share->m_clientIPv6, share->m_clientAddr, server->m_banTime);
+		// Ban functionality disabled
+		// server->ban(share->m_clientIPv6, share->m_clientAddr, server->m_banTime);
 	}
 
 	if (share->m_allocated) {
@@ -1236,7 +1239,8 @@ bool StratumServer::StratumClient::on_read(const char* data, uint32_t size)
 	auto on_parse = [this](const char* data, uint32_t size) {
 		if (static_cast<size_t>(m_stratumReadBufBytes) + size > STRATUM_BUF_SIZE) {
 			LOGWARN(4, "client " << static_cast<const char*>(m_addrString) << " sent too long Stratum message");
-			ban(static_cast<StratumServer*>(m_owner)->m_banTime);
+			// Ban functionality disabled
+			// ban(static_cast<StratumServer*>(m_owner)->m_banTime);
 			return false;
 		}
 
@@ -1264,7 +1268,8 @@ bool StratumServer::StratumClient::on_read(const char* data, uint32_t size)
 
 				*c = '\0';
 				if (!process_request(line_start, static_cast<uint32_t>(c - line_start))) {
-					ban(static_cast<StratumServer*>(m_owner)->m_banTime);
+					// Ban functionality disabled
+					// ban(static_cast<StratumServer*>(m_owner)->m_banTime);
 					return false;
 				}
 
