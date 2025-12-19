@@ -347,6 +347,8 @@ bool TCPServer::connect_to_peer(const std::string& domain, int port)
 bool TCPServer::is_banned(bool is_v6, raw_ip ip)
 {
 	// Ban functionality disabled - always return false
+	(void)is_v6;
+	(void)ip;
 	return false;
 	
 	// Original code (disabled):
@@ -548,6 +550,9 @@ void TCPServer::print_status()
 void TCPServer::ban(bool is_v6, raw_ip ip, uint64_t seconds)
 {
 	// Ban functionality disabled - do nothing
+	(void)is_v6;
+	(void)ip;
+	(void)seconds;
 	return;
 	
 	// Original code (disabled):
@@ -1364,6 +1369,7 @@ void TCPServer::Client::close()
 void TCPServer::Client::ban(uint64_t seconds)
 {
 	// Ban functionality disabled - do nothing
+	(void)seconds;
 	return;
 	
 	// Original code (disabled):
