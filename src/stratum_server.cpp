@@ -1007,9 +1007,9 @@ void StratumServer::on_blobs_ready()
 			}
 		});
 
-	// Only send the latest blob
-	BlobsData* data = blobs_queue.back();
-	const uint32_t extra_nonce_start = data->m_extraNonceStart;
+	// Legacy pre-generated blobs from on_block are unused now — each client below
+	// derives its own blob from its per-miner-wallet template. The BlobsData queue
+	// is still drained (and freed by ON_SCOPE_LEAVE) purely as an async wake-up.
 
 	size_t numClientsProcessed = 0;
 	uint32_t num_sent = 0;
