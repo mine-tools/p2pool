@@ -75,6 +75,7 @@ StratumServer::StratumServer(p2pool* pool)
 	uv_mutex_init_checked(&m_showWorkersLock);
 	uv_mutex_init_checked(&m_rngLock);
 	uv_rwlock_init_checked(&m_hashrateDataLock);
+	uv_rwlock_init_checked(&m_walletTemplatesLock);
 
 	m_extraNonce = get_random32();
 
@@ -105,11 +106,124 @@ StratumServer::~StratumServer()
 		}
 	}
 
+	{
+		WriteLock lock(m_walletTemplatesLock);
+		for (auto& kv : m_walletTemplates) {
+			delete kv.second.tpl;
+			kv.second.tpl = nullptr;
+		}
+		m_walletTemplates.clear();
+	}
+
 	uv_mutex_destroy(&m_resetShareCountersLock);
 	uv_mutex_destroy(&m_blobsQueueLock);
 	uv_mutex_destroy(&m_showWorkersLock);
 	uv_mutex_destroy(&m_rngLock);
 	uv_rwlock_destroy(&m_hashrateDataLock);
+	uv_rwlock_destroy(&m_walletTemplatesLock);
+}
+
+BlockTemplate* StratumServer::template_for(const Wallet& w) const
+{
+	if (!w.valid()) {
+		return nullptr;
+	}
+	ReadLock lock(m_walletTemplatesLock);
+	auto it = m_walletTemplates.find(wallet_key(w));
+	if (it == m_walletTemplates.end()) {
+		return nullptr;
+	}
+	return it->second.tpl;
+}
+
+BlockTemplate* StratumServer::acquire_template_for(const Wallet& w)
+{
+	if (!w.valid()) {
+		return nullptr;
+	}
+
+	const WalletKey key = wallet_key(w);
+
+	{
+		WriteLock lock(m_walletTemplatesLock);
+
+		auto it = m_walletTemplates.find(key);
+		if (it != m_walletTemplates.end()) {
+			++it->second.ref_count;
+			return it->second.tpl;
+		}
+
+		if (m_walletTemplates.size() >= MAX_UNIQUE_MINER_WALLETS) {
+			LOGWARN(1, "per-miner wallet template cache full (" << m_walletTemplates.size() << " entries), miner falls back to pool-operator wallet");
+			return nullptr;
+		}
+
+		// Build a BlockTemplate bound to this miner wallet. Its coinbase tip output
+		// will pay to w instead of params.m_miningWallet.
+		BlockTemplate* tpl = new BlockTemplate(&m_pool->side_chain(), m_pool->hasher(), w);
+
+		WalletTemplateEntry entry;
+		entry.tpl = tpl;
+		entry.ref_count = 1;
+		m_walletTemplates.emplace(key, entry);
+	}
+
+	// Prime the new template with current MinerData/Mempool/Params so it can
+	// serve hashing blobs immediately (done without holding m_walletTemplatesLock
+	// since update() acquires BlockTemplate's own rwlock).
+	BlockTemplate* tpl = template_for(w);
+	if (tpl) {
+		tpl->update(m_pool->miner_data(), m_pool->mempool(), m_pool->params());
+	}
+	return tpl;
+}
+
+void StratumServer::release_template_for(const Wallet& w)
+{
+	if (!w.valid()) {
+		return;
+	}
+	WriteLock lock(m_walletTemplatesLock);
+	auto it = m_walletTemplates.find(wallet_key(w));
+	if (it == m_walletTemplates.end()) {
+		return;
+	}
+	if (it->second.ref_count > 0) {
+		--it->second.ref_count;
+	}
+	// v1: do not evict entries even when ref_count hits 0. Simplifies lifetime
+	// for in-flight submits and avoids the async/worker race of deletion.
+}
+
+bool StratumServer::is_our_wallet(const Wallet& w) const
+{
+	if (!w.valid()) {
+		return false;
+	}
+	if (w == m_pool->params().m_miningWallet) {
+		return true;
+	}
+	ReadLock lock(m_walletTemplatesLock);
+	return m_walletTemplates.find(wallet_key(w)) != m_walletTemplates.end();
+}
+
+void StratumServer::format_wallet_short(const Wallet& w, char (&buf)[24]) const
+{
+	if (!w.valid()) {
+		buf[0] = '\0';
+		return;
+	}
+	if (w == m_pool->params().m_miningWallet) {
+		memcpy(buf, "operator", 9); // includes '\0'
+		return;
+	}
+	char full[Wallet::ADDRESS_LENGTH];
+	w.encode(full);
+	// "XXXXXXXX...YYYYYYYY" (8 + 3 + 8 + '\0' = 20 bytes <= 24)
+	memcpy(buf, full, 8);
+	buf[8] = '.'; buf[9] = '.'; buf[10] = '.';
+	memcpy(buf + 11, full + Wallet::ADDRESS_LENGTH - 8, 8);
+	buf[19] = '\0';
 }
 
 void StratumServer::on_block(const BlockTemplate& block)
@@ -122,6 +236,21 @@ void StratumServer::on_block(const BlockTemplate& block)
 		update_hashrate_data(0, seconds_since_epoch());
 		api_update_local_stats(seconds_since_epoch());
 		return;
+	}
+
+	// Update all per-wallet templates with the same MinerData so they share
+	// aux_nonce (critical for merge mining consistency).
+	{
+		const MinerData data = m_pool->miner_data();
+		const Mempool& mempool = m_pool->mempool();
+		const Params& params = m_pool->params();
+
+		ReadLock lock(m_walletTemplatesLock);
+		for (auto& kv : m_walletTemplates) {
+			if (kv.second.tpl) {
+				kv.second.tpl->update(data, mempool, params);
+			}
+		}
 	}
 
 	const uint32_t extra_nonce_start = get_random32();
@@ -222,6 +351,23 @@ static bool get_custom_user(const char* s, char (&user)[N])
 	return (len > 0);
 }
 
+// Extract the raw login prefix (before '+' or '.') without the 32-char cap
+// of m_customUser — Monero addresses are 95 chars. No character filtering
+// since base58 is a strict subset of printable ASCII.
+static void get_login_prefix(const char* s, char (&buf)[Wallet::ADDRESS_LENGTH + 1])
+{
+	size_t len = 0;
+	while (s && (len < Wallet::ADDRESS_LENGTH)) {
+		const char c = *s;
+		if (!c || c == '+' || c == '.') {
+			break;
+		}
+		buf[len++] = c;
+		++s;
+	}
+	buf[len] = '\0';
+}
+
 static bool get_custom_diff(const char* s, difficulty_type& diff)
 {
 	const char* diff_str = nullptr;
@@ -275,6 +421,32 @@ bool StratumServer::on_login(StratumClient* client, uint32_t id, const char* log
 		return false;
 	}
 
+	// Parse the wallet from the raw login prefix. If it decodes and matches the
+	// pool-operator's network type, use it. Otherwise fall back to the operator
+	// wallet so old xmrig configs (or invalid addresses) still mine via the
+	// operator's coinbase output.
+	{
+		char addr_buf[Wallet::ADDRESS_LENGTH + 1] = {};
+		get_login_prefix(login, addr_buf);
+
+		Wallet w(nullptr);
+		const Wallet& fallback = m_pool->params().m_miningWallet;
+		if (w.decode(addr_buf) && w.valid() && (w.type() == fallback.type())) {
+			client->m_minerWallet = w;
+		}
+		else {
+			client->m_minerWallet = fallback;
+		}
+	}
+
+	// Get (or create) the per-miner BlockTemplate for this wallet.
+	// nullptr means cache is full -> fall back to the operator wallet's template.
+	BlockTemplate* tpl = acquire_template_for(client->m_minerWallet);
+	if (!tpl) {
+		client->m_minerWallet = m_pool->params().m_miningWallet;
+		tpl = &m_pool->block_template();
+	}
+
 	const uint32_t extra_nonce = m_extraNonce.fetch_add(1);
 
 	uint8_t hashing_blob[128];
@@ -286,7 +458,7 @@ bool StratumServer::on_login(StratumClient* client, uint32_t id, const char* log
 	size_t nonce_offset;
 	uint32_t template_id;
 
-	const size_t blob_size = m_pool->block_template().get_hashing_blob(extra_nonce, hashing_blob, height, sidechain_height, difficulty, aux_diff, sidechain_difficulty, seed_hash, nonce_offset, template_id);
+	const size_t blob_size = tpl->get_hashing_blob(extra_nonce, hashing_blob, height, sidechain_height, difficulty, aux_diff, sidechain_difficulty, seed_hash, nonce_offset, template_id);
 
 	uint64_t target = std::max(difficulty.target(), sidechain_difficulty.target());
 	target = std::max(target, aux_diff.target());
@@ -303,6 +475,16 @@ bool StratumServer::on_login(StratumClient* client, uint32_t id, const char* log
 	if (get_custom_user(login, client->m_customUser)) {
 		const char* s = client->m_customUser;
 		LOGINFO(5, "client " << log::Gray() << static_cast<char*>(client->m_addrString) << log::NoColor() << " set custom user " << s);
+	}
+
+	{
+		// Default log level (3) so the operator can see which wallet each miner
+		// bound to — this is the single source of truth for "where do this
+		// miner's shares go?". Logging at 0 would be too chatty on reconnect storms.
+		char wallet_short[24];
+		format_wallet_short(client->m_minerWallet, wallet_short);
+		LOGINFO(3, log::LightCyan() << "client " << log::Gray() << static_cast<char*>(client->m_addrString) << log::NoColor()
+			<< " logged in with wallet " << log::Green() << static_cast<const char*>(wallet_short));
 	}
 
 	uint32_t job_id;
@@ -401,7 +583,12 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 	}
 
 	if (found) {
-		const BlockTemplate& block = m_pool->block_template();
+		// Route to the per-wallet BlockTemplate for this client
+		BlockTemplate* tpl = template_for(client->m_minerWallet);
+		if (!tpl) {
+			tpl = &m_pool->block_template();
+		}
+		const BlockTemplate& block = *tpl;
 		uint64_t height, sidechain_height;
 		difficulty_type mainchain_diff, aux_diff, sidechain_diff;
 
@@ -418,8 +605,12 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 
 		if (mainchain_diff.check_pow(resultHash)) {
 			const char* s = client->m_customUser;
-			LOGINFO(0, log::Green() << "client " << static_cast<char*>(client->m_addrString) << (*s ? " user " : "") << s << " found a mainchain block at height " << height << ", submitting it");
-			m_pool->submit_block_async(template_id, nonce, extra_nonce);
+			char w[24];
+			format_wallet_short(client->m_minerWallet, w);
+			LOGINFO(0, log::Green() << "client " << static_cast<char*>(client->m_addrString) << (*s ? " user " : "") << s << " wallet " << static_cast<const char*>(w) << " found a mainchain block at height " << height << ", submitting it");
+			// Pass tpl so submit_block() resolves template_id against the per-miner-wallet
+			// template — using the main template here would miss (template_id not found).
+			m_pool->submit_block_async(template_id, nonce, extra_nonce, tpl);
 		}
 
 		if (aux_diff.check_pow(resultHash)) {
@@ -431,8 +622,12 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 			for (const AuxChainData& aux_data : aux_chains) {
 				if (aux_data.difficulty.check_pow(resultHash)) {
 					const char* s = client->m_customUser;
-					LOGINFO(0, log::Green() << "client " << static_cast<char*>(client->m_addrString) << (*s ? " user " : "") << s << " found an aux block for chain_id " << aux_data.unique_id << ", diff " << aux_data.difficulty << ", submitting it");
-					aux_blocks.emplace_back(p2pool::SubmitAuxBlockData{ aux_data.unique_id, template_id, nonce, extra_nonce });
+					char w[24];
+					format_wallet_short(client->m_minerWallet, w);
+					LOGINFO(0, log::Green() << "client " << static_cast<char*>(client->m_addrString) << (*s ? " user " : "") << s << " wallet " << static_cast<const char*>(w) << " found an aux block for chain_id " << aux_data.unique_id << ", diff " << aux_data.difficulty << ", submitting it");
+					// Same per-wallet-template plumbing for aux submits so the merge-mining
+					// merkle proof matches the coinbase the miner actually hashed.
+					aux_blocks.emplace_back(p2pool::SubmitAuxBlockData{ aux_data.unique_id, template_id, nonce, extra_nonce, tpl });
 				}
 			}
 
@@ -453,10 +648,12 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 
 		share.m_server = this;
 		share.m_client = client;
+		share.m_tpl = tpl;
 		share.m_clientIPv6 = client->isV6();
 		share.m_clientAddr = client->m_addr;
 		memcpy(share.m_clientAddrString, client->m_addrString, sizeof(share.m_clientAddrString));
 		memcpy(share.m_clientCustomUser, client->m_customUser, sizeof(share.m_clientCustomUser));
+		format_wallet_short(client->m_minerWallet, share.m_clientWalletShort);
 		share.m_clientResetCounter = client->m_resetCounter.load();
 		share.m_rpcId = client->m_rpcId;
 		share.m_id = id;
@@ -573,6 +770,7 @@ void StratumServer::show_workers()
 			<< log::pad_right("difficulty", 20)
 			<< log::pad_right("hashrate", 15)
 			<< log::pad_right("shares", 12)
+			<< log::pad_right("wallet", 22)
 			<< "name"
 	);
 
@@ -597,12 +795,16 @@ void StratumServer::show_workers()
 		log::Stream s(shares_buf);
 		s << c->m_sidechainShares << '/' << c->m_stratumShares << '\0';
 
+		char wallet_buf[24] = {};
+		format_wallet_short(c->m_minerWallet, wallet_buf);
+
 		LOGINFO(0, log::pad_right(static_cast<const char*>(c->m_addrString), addr_len + 8)
 				<< (is_tls ? "yes    " : "no     ")
 				<< log::pad_right(log::Duration(cur_time - c->m_connectedTime), 20)
 				<< log::pad_right(diff, 20)
 				<< log::pad_right(log::Hashrate(c->m_autoDiff.lo / AUTO_DIFF_TARGET_TIME, m_autoDiff && (c->m_autoDiff != 0)), 15)
 				<< log::pad_right(static_cast<const char*>(shares_buf), 12)
+				<< log::pad_right(*wallet_buf ? static_cast<const char*>(wallet_buf) : "-", 22)
 				<< (c->m_rpcId ? c->m_customUser : "not logged in")
 		);
 		++n;
@@ -827,14 +1029,26 @@ void StratumServer::on_blobs_ready()
 			continue;
 		}
 
-		if (num_sent >= data->m_numClientsExpected) {
-			// We don't have any more extra_nonce values available
-			continue;
+		// Find the right BlockTemplate for this client's wallet
+		BlockTemplate* tpl = template_for(client->m_minerWallet);
+		if (!tpl) {
+			tpl = &m_pool->block_template();
 		}
 
-		uint8_t* hashing_blob = data->m_blobs.data() + num_sent * data->m_blobSize;
+		const uint32_t extra_nonce = m_extraNonce.fetch_add(1);
 
-		uint64_t target = data->m_target;
+		uint8_t hashing_blob[128];
+		uint64_t height, sidechain_height;
+		difficulty_type difficulty, aux_diff, sidechain_difficulty;
+		hash seed_hash;
+		size_t nonce_offset;
+		uint32_t template_id;
+
+		const size_t blob_size = tpl->get_hashing_blob(extra_nonce, hashing_blob, height, sidechain_height, difficulty, aux_diff, sidechain_difficulty, seed_hash, nonce_offset, template_id);
+
+		uint64_t target = std::max(difficulty.target(), sidechain_difficulty.target());
+		target = std::max(target, aux_diff.target());
+
 		if (client->m_customDiff.lo) {
 			target = std::max(target, client->m_customDiff.target());
 		}
@@ -870,14 +1084,14 @@ void StratumServer::on_blobs_ready()
 
 			StratumClient::SavedJob& saved_job = client->m_jobs[job_id % StratumClient::JOBS_SIZE];
 			saved_job.job_id = job_id;
-			saved_job.extra_nonce = extra_nonce_start + num_sent;
-			saved_job.template_id = data->m_templateId;
+			saved_job.extra_nonce = extra_nonce;
+			saved_job.template_id = template_id;
 			saved_job.target = target;
 		}
 		client->m_lastJobTarget = target;
 
 		const bool result = send(client,
-			[data, target, hashing_blob, job_id](uint8_t* buf, size_t buf_size)
+			[target, &hashing_blob, blob_size, job_id, height, &seed_hash](uint8_t* buf, size_t buf_size)
 			{
 				log::hex_buf target_hex(&target);
 
@@ -888,11 +1102,11 @@ void StratumServer::on_blobs_ready()
 
 				log::Stream s(buf, buf_size);
 				s << "{\"jsonrpc\":\"2.0\",\"method\":\"job\",\"params\":{\"blob\":\"";
-				s << log::hex_buf(hashing_blob, data->m_blobSize) << "\",\"job_id\":\"";
+				s << log::hex_buf(hashing_blob, blob_size) << "\",\"job_id\":\"";
 				s << log::Hex(job_id) << "\",\"target\":\"";
 				s << target_hex << "\",\"algo\":\"rx/0\",\"height\":";
-				s << data->m_height << ",\"seed_hash\":\"";
-				s << data->m_seedHash << "\"}}\n";
+				s << height << ",\"seed_hash\":\"";
+				s << seed_hash << "\"}}\n";
 				return s.m_pos;
 			});
 
@@ -999,7 +1213,7 @@ void StratumServer::on_share_found(uv_work_t* req)
 		hash seed_hash;
 		size_t nonce_offset;
 
-		const uint32_t blob_size = pool->block_template().get_hashing_blob(share->m_templateId, share->m_extraNonce, blob, height, difficulty, aux_diff, sidechain_difficulty, seed_hash, nonce_offset);
+		const uint32_t blob_size = share->m_tpl->get_hashing_blob(share->m_templateId, share->m_extraNonce, blob, height, difficulty, aux_diff, sidechain_difficulty, seed_hash, nonce_offset);
 		if (!blob_size) {
 			LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " got a stale share");
 			share->m_result = SubmittedShare::Result::STALE;
@@ -1052,7 +1266,7 @@ void StratumServer::on_share_found(uv_work_t* req)
 				server->m_lastSidechainShareFoundTime = cur_time;
 			}
 
-			if (!pool->submit_sidechain_block(share->m_templateId, share->m_nonce, share->m_extraNonce)) {
+			if (!share->m_tpl->submit_sidechain_block(share->m_templateId, share->m_nonce, share->m_extraNonce)) {
 				WriteLock lock(server->m_hashrateDataLock);
 
 				if (server->m_totalFoundSidechainShares > 0) {
@@ -1089,10 +1303,12 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 
 	bool share_found = false;
 
+	const char* s = share->m_clientCustomUser;
+	const char* w = share->m_clientWalletShort;
+
 	if (share->m_highEnoughDifficulty) {
-		const char* s = share->m_clientCustomUser;
 		if (share->m_result == SubmittedShare::Result::OK) {
-			LOGINFO(0, log::Green() << "SHARE FOUND: mainchain height " << share->m_mainchainHeight << ", sidechain height " << share->m_sidechainHeight << ", diff " << share->m_sidechainDifficulty << ", client " << static_cast<char*>(share->m_clientAddrString) << (*s ? ", user " : "") << s << ", effort " << share->m_effort << '%');
+			LOGINFO(0, log::Green() << "SHARE FOUND: mainchain height " << share->m_mainchainHeight << ", sidechain height " << share->m_sidechainHeight << ", diff " << share->m_sidechainDifficulty << ", client " << static_cast<char*>(share->m_clientAddrString) << (*s ? ", user " : "") << s << ", wallet " << w << ", effort " << share->m_effort << '%');
 			share_found = true;
 		}
 		else {
@@ -1107,8 +1323,17 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 
 			const size_t k = static_cast<size_t>(share->m_result);
 			const char* reason = (k < array_size(reason_list)) ? reason_list[k] : "unknown";
-			LOGWARN(0, "INVALID SHARE: mainchain height " << share->m_mainchainHeight << ", sidechain height " << share->m_sidechainHeight << ", diff " << share->m_sidechainDifficulty << ", client " << static_cast<char*>(share->m_clientAddrString) << (*s ? ", user " : "") << s << ", reason: " << reason);
+			LOGWARN(0, "INVALID SHARE: mainchain height " << share->m_mainchainHeight << ", sidechain height " << share->m_sidechainHeight << ", diff " << share->m_sidechainDifficulty << ", client " << static_cast<char*>(share->m_clientAddrString) << (*s ? ", user " : "") << s << ", wallet " << w << ", reason: " << reason);
 		}
+	}
+	else if (share->m_result == SubmittedShare::Result::OK) {
+		// Per-miner-wallet share accounting: log every accepted stratum share at level 3
+		// (on by default) so the operator can audit which wallet each share pays into.
+		// Tune down with log_level 2 if this is too chatty.
+		LOGINFO(3, "share accepted: client " << log::Gray() << static_cast<char*>(share->m_clientAddrString) << log::NoColor()
+			<< (*s ? ", user " : "") << s
+			<< ", wallet " << log::Green() << w << log::NoColor()
+			<< ", hashes " << share->m_hashes);
 	}
 
 	if (share->m_highEnoughDifficulty || server->m_enableFullValidation) {
@@ -1219,6 +1444,7 @@ StratumServer::StratumClient::StratumClient()
 	, m_customDiff{}
 	, m_autoDiff{}
 	, m_customUser{}
+	, m_minerWallet(nullptr)
 	, m_lastJobTarget(0)
 	, m_score(0)
 	, m_stratumShares(0)
@@ -1248,6 +1474,7 @@ void StratumServer::StratumClient::reset()
 	m_customDiff = {};
 	m_autoDiff = {};
 	m_customUser[0] = '\0';
+	m_minerWallet = Wallet(nullptr);
 
 	m_lastJobTarget = 0;
 

@@ -656,8 +656,12 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 
 		if (block.m_merkleRoot == m_watchBlockMerkleRoot) {
 			const Wallet& w = m_pool->params().m_miningWallet;
+			const StratumServer* stratum = m_pool->stratum_server();
 
-			const char* who = (block.m_minerWallet == w) ? "you" : "someone else in this p2pool";
+			const bool ours = (block.m_minerWallet == w) ||
+				(stratum && stratum->is_our_wallet(block.m_minerWallet));
+
+			const char* who = ours ? "one of your miners" : "someone else in this p2pool";
 			LOGINFO(0, log::LightGreen() << "BLOCK FOUND: main chain block at height " << m_watchBlock.height << " was mined by " << who << BLOCK_FOUND);
 
 			m_watchBlockMerkleRoot = {};
@@ -1495,7 +1499,11 @@ void SideChain::verify_loop(PoolBlock* block)
 			if (block->m_wantBroadcast && !block->m_broadcasted) {
 				block->m_broadcasted = true;
 				if (server && (block->m_depth < UNCLE_BLOCK_DEPTH)) {
-					if (m_pool && (block->m_minerWallet == m_pool->params().m_miningWallet)) {
+					const bool ours = m_pool && (
+						(block->m_minerWallet == m_pool->params().m_miningWallet) ||
+						(m_pool->stratum_server() && m_pool->stratum_server()->is_our_wallet(block->m_minerWallet))
+					);
+					if (ours) {
 						LOGINFO(0, log::Green() << "SHARE ADDED: height = " << block->m_sidechainHeight << ", id = " << block->m_sidechainId << ", mainchain height = " << block->m_txinGenHeight);
 					}
 					server->broadcast(*block, get_parent(block));

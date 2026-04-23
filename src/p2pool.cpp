@@ -603,11 +603,13 @@ void p2pool::handle_chain_main(ChainMain& data, const char* extra, const std::ve
 	if (!merkle_root.empty()) {
 		const PoolBlock* block = side_chain().find_block_by_merkle_root(merkle_root);
 		if (block) {
-			const Wallet& w = params().m_miningWallet;
+			const bool ours = (block->m_minerWallet == params().m_miningWallet) ||
+				(m_stratumServer && m_stratumServer->is_our_wallet(block->m_minerWallet));
 
-			const char* who = (block->m_minerWallet == w) ? "you" : "someone else in this p2pool";
+			const char* who = ours ? "one of your miners" : "someone else in this p2pool";
 			LOGINFO(0, log::LightGreen() << "BLOCK FOUND: main chain block at height " << data.height << " was mined by " << who << BLOCK_FOUND);
 
+			const Wallet& w = params().m_miningWallet;
 			const uint64_t payout = block->get_payout(w);
 			if (payout) {
 				LOGINFO(0, log::LightCyan() << "Your wallet " << log::LightGreen() << params().m_displayWallet << log::LightCyan() << " got a payout of " << log::LightGreen() << log::XMRAmount(payout) << log::LightCyan() << " in block " << log::LightGreen() << data.height);
@@ -853,7 +855,7 @@ void p2pool::send_aux_job_donation()
 }
 #endif
 
-void p2pool::submit_block_async(uint32_t template_id, uint32_t nonce, uint32_t extra_nonce)
+void p2pool::submit_block_async(uint32_t template_id, uint32_t nonce, uint32_t extra_nonce, const BlockTemplate* tpl)
 {
 	{
 		MutexLock lock(m_submitBlockDataLock);
@@ -862,6 +864,7 @@ void p2pool::submit_block_async(uint32_t template_id, uint32_t nonce, uint32_t e
 		m_submitBlockData.nonce = nonce;
 		m_submitBlockData.extra_nonce = extra_nonce;
 		m_submitBlockData.blob.clear();
+		m_submitBlockData.tpl = tpl;
 	}
 
 	// If p2pool is stopped, m_submitBlockAsync is most likely already closed
@@ -886,6 +889,7 @@ void p2pool::submit_block_async(std::vector<uint8_t>&& blob)
 		m_submitBlockData.nonce = 0;
 		m_submitBlockData.extra_nonce = 0;
 		m_submitBlockData.blob = std::move(blob);
+		m_submitBlockData.tpl = nullptr;
 	}
 
 	// If p2pool is stopped, m_submitBlockAsync is most likely already closed
@@ -934,6 +938,8 @@ void p2pool::submit_aux_block() const
 		const uint32_t template_id = submit_data[i].template_id;
 		const uint32_t nonce = submit_data[i].nonce;
 		const uint32_t extra_nonce = submit_data[i].extra_nonce;
+		// Per-miner-wallet template the aux share was mined against (nullptr -> main template).
+		const BlockTemplate* src_tpl = submit_data[i].tpl ? submit_data[i].tpl : m_blockTemplate;
 
 		LOGINFO(3, "submit_aux_block: template id = " << template_id << ", chain_id = " << chain_id << ", nonce = " << nonce << ", extra_nonce = " << extra_nonce);
 
@@ -943,14 +949,14 @@ void p2pool::submit_aux_block() const
 		root_hash merge_mining_root;
 		const BlockTemplate* block_tpl = nullptr;
 
-		std::vector<uint8_t> blob = m_blockTemplate->get_block_template_blob(template_id, extra_nonce, nonce_offset, extra_nonce_offset, merkle_root_offset, merge_mining_root, &block_tpl);
+		std::vector<uint8_t> blob = src_tpl->get_block_template_blob(template_id, extra_nonce, nonce_offset, extra_nonce_offset, merkle_root_offset, merge_mining_root, &block_tpl);
 
 		uint8_t hashing_blob[128] = {};
 		uint64_t height = 0;
 		difficulty_type diff, aux_diff, sidechain_diff;
 		hash seed_hash;
 
-		m_blockTemplate->get_hashing_blob(template_id, extra_nonce, hashing_blob, height, diff, aux_diff, sidechain_diff, seed_hash, nonce_offset);
+		src_tpl->get_hashing_blob(template_id, extra_nonce, hashing_blob, height, diff, aux_diff, sidechain_diff, seed_hash, nonce_offset);
 
 		if (blob.empty()) {
 			LOGWARN(3, "submit_aux_block: block template blob not found");
@@ -975,7 +981,7 @@ void p2pool::submit_aux_block() const
 				std::vector<hash> proof;
 				uint32_t path;
 
-				if (m_blockTemplate->get_aux_proof(template_id, extra_nonce, chain_params.aux_hash, proof, path)) {
+				if (src_tpl->get_aux_proof(template_id, extra_nonce, chain_params.aux_hash, proof, path)) {
 					if (pool_block_debug()) {
 						const MinerData data = miner_data();
 						const uint32_t n_aux_chains = static_cast<uint32_t>(data.aux_chains.size() + 1);
@@ -1054,8 +1060,12 @@ void p2pool::submit_block() const
 		submit_data = m_submitBlockData;
 	}
 
-	const uint64_t height = m_blockTemplate->height();
-	const difficulty_type diff = m_blockTemplate->difficulty();
+	// Use the per-miner-wallet template when the share was found against one.
+	// Otherwise fall back to the operator's main template (built-in miner, external blobs).
+	const BlockTemplate* src_tpl = submit_data.tpl ? submit_data.tpl : m_blockTemplate;
+
+	const uint64_t height = src_tpl->height();
+	const difficulty_type diff = src_tpl->difficulty();
 
 	size_t nonce_offset = 0;
 	size_t extra_nonce_offset = 0;
@@ -1066,7 +1076,7 @@ void p2pool::submit_block() const
 	bool is_external = false;
 
 	if (submit_data.blob.empty()) {
-		submit_data.blob = m_blockTemplate->get_block_template_blob(submit_data.template_id, submit_data.extra_nonce, nonce_offset, extra_nonce_offset, merkle_root_offset, merge_mining_root, &block_tpl);
+		submit_data.blob = src_tpl->get_block_template_blob(submit_data.template_id, submit_data.extra_nonce, nonce_offset, extra_nonce_offset, merkle_root_offset, merge_mining_root, &block_tpl);
 
 		LOGINFO(0, log::LightGreen() << "submit_block: height = " << height
 			<< ", template id = " << submit_data.template_id

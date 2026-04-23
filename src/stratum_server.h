@@ -18,11 +18,14 @@
 #pragma once
 
 #include "tcp_server.h"
+#include "wallet.h"
+#include <unordered_map>
 
 namespace p2pool {
 
 class p2pool;
 class BlockTemplate;
+struct MinerData;
 
 static constexpr size_t STRATUM_BUF_SIZE = log::Stream::BUF_SIZE + 1;
 static constexpr size_t STRATUM_CALLBACK_BUF_SIZE = 16384;
@@ -35,6 +38,14 @@ public:
 	~StratumServer() override;
 
 	void on_block(const BlockTemplate& block);
+
+	// True if this wallet is either the pool-operator's fallback wallet
+	// or one of the per-miner wallets currently hosted on this node.
+	[[nodiscard]] bool is_our_wallet(const Wallet& w) const;
+
+	// Max unique miner wallets we will service in addition to the operator wallet.
+	// If exceeded, additional miners fall back to the operator's wallet.
+	static constexpr size_t MAX_UNIQUE_MINER_WALLETS = 256;
 
 	struct StratumClient : public Client
 	{
@@ -87,6 +98,10 @@ public:
 		difficulty_type m_customDiff;
 		difficulty_type m_autoDiff;
 		char m_customUser[CUSTOM_USER_SIZE];
+
+		// Wallet parsed from stratum login. Invalid = fallback to pool-operator wallet.
+		// When valid, this client's shares pay to this wallet via its per-miner BlockTemplate.
+		Wallet m_minerWallet{ nullptr };
 
 		uint64_t m_lastJobTarget;
 
@@ -152,6 +167,46 @@ private:
 
 	std::atomic<uint32_t> m_extraNonce;
 
+	// Per-miner-wallet BlockTemplate cache (unique_ptr<BlockTemplate> held alive for
+	// the life of this server — never evicted in v1 to keep submit paths simple).
+	// Each StratumClient's m_minerWallet maps into this cache; if it exceeds
+	// MAX_UNIQUE_MINER_WALLETS new miners fall back to the operator wallet.
+	struct WalletKey {
+		hash spend;
+		hash view;
+		FORCEINLINE bool operator==(const WalletKey& o) const { return (spend == o.spend) && (view == o.view); }
+	};
+	struct WalletKeyHash {
+		FORCEINLINE size_t operator()(const WalletKey& k) const noexcept {
+			size_t h = 0;
+			memcpy(&h, k.spend.h, sizeof(size_t));
+			return h;
+		}
+	};
+	struct WalletTemplateEntry {
+		BlockTemplate* tpl = nullptr;
+		uint32_t ref_count = 0;
+	};
+	mutable uv_rwlock_t m_walletTemplatesLock;
+	std::unordered_map<WalletKey, WalletTemplateEntry, WalletKeyHash> m_walletTemplates;
+
+	static WalletKey wallet_key(const Wallet& w) { return { w.spend_public_key(), w.view_public_key() }; }
+
+public:
+	// Get (or lazily create) a BlockTemplate for the given wallet and increment its ref_count.
+	// Returns nullptr when the cache is full; caller should fall back to the operator wallet.
+	[[nodiscard]] BlockTemplate* acquire_template_for(const Wallet& w);
+	// Decrement ref_count for the given wallet. Entry is not removed in v1.
+	void release_template_for(const Wallet& w);
+
+	// Look up the BlockTemplate for a wallet without touching ref_count. Returns nullptr if not cached.
+	[[nodiscard]] BlockTemplate* template_for(const Wallet& w) const;
+
+	// Fill short wallet label for logs ("4ABCDEFG...WXYZ1234" or "operator" fallback).
+	void format_wallet_short(const Wallet& w, char (&buf)[24]) const;
+
+private:
+
 	uv_mutex_t m_rngLock;
 	std::mt19937_64 m_rng;
 
@@ -162,10 +217,17 @@ private:
 
 		StratumServer* m_server;
 		StratumClient* m_client;
+		// BlockTemplate used to generate the share's job (per-miner-wallet aware).
+		// Must remain valid for the lifetime of this submission (we don't evict templates in v1).
+		BlockTemplate* m_tpl;
 		bool m_clientIPv6;
 		raw_ip m_clientAddr;
 		char m_clientAddrString[Client::ADDR_STRING_SIZE];
 		char m_clientCustomUser[StratumClient::CUSTOM_USER_SIZE];
+		// Short form of the miner's wallet for logs: first 8 + "..." + last 8 chars,
+		// or "operator" when the client uses the pool-operator fallback wallet. Empty
+		// string when no wallet is attached yet (e.g. pre-login).
+		char m_clientWalletShort[24];
 		uint32_t m_clientResetCounter;
 		uint32_t m_rpcId;
 		uint32_t m_id;

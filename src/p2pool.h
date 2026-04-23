@@ -51,6 +51,7 @@ public:
 	const Params& params() const { return m_params; }
 	BlockTemplate& block_template() { return *m_blockTemplate; }
 	SideChain& side_chain() { return *m_sideChain; }
+	Mempool& mempool() const { return *m_mempool; }
 
 	FORCEINLINE const Params::Host& current_host() const
 	{
@@ -95,7 +96,11 @@ public:
 
 	void update_aux_data(const hash& chain_id);
 
-	void submit_block_async(uint32_t template_id, uint32_t nonce, uint32_t extra_nonce);
+	// `tpl` is the BlockTemplate the share was mined against. nullptr selects the
+	// pool-operator's main m_blockTemplate (used by the built-in miner and any
+	// pre-per-miner-wallet caller). StratumServer passes the per-miner wallet
+	// template so template_id lookups resolve against that client's coinbase.
+	void submit_block_async(uint32_t template_id, uint32_t nonce, uint32_t extra_nonce, const BlockTemplate* tpl = nullptr);
 	void submit_block_async(std::vector<uint8_t>&& blob);
 
 	struct SubmitAuxBlockData
@@ -104,6 +109,8 @@ public:
 		uint32_t template_id = 0;
 		uint32_t nonce = 0;
 		uint32_t extra_nonce = 0;
+		// nullptr -> use m_blockTemplate (built-in miner); non-null -> per-miner-wallet template.
+		const BlockTemplate* tpl = nullptr;
 	};
 
 	void submit_aux_block_async(const std::vector<SubmitAuxBlockData>& aux_blocks);
@@ -243,6 +250,8 @@ private:
 		uint32_t nonce = 0;
 		uint32_t extra_nonce = 0;
 		std::vector<uint8_t> blob;
+		// Which BlockTemplate this share's template_id lives in. nullptr -> m_blockTemplate.
+		const BlockTemplate* tpl = nullptr;
 	};
 
 	mutable uv_mutex_t m_submitBlockDataLock;

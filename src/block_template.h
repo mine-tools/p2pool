@@ -18,6 +18,7 @@
 #pragma once
 
 #include "uv_util.h"
+#include "wallet.h"
 
 #define TEST_MEMPOOL_PICKING_ALGORITHM 0
 
@@ -26,7 +27,6 @@ namespace p2pool {
 class SideChain;
 class RandomX_Hasher_Base;
 class Mempool;
-class Wallet;
 struct PoolBlock;
 struct MinerShare;
 struct Params;
@@ -35,10 +35,16 @@ class BlockTemplate
 {
 public:
 	explicit BlockTemplate(SideChain* sidechain, RandomX_Hasher_Base* hasher);
+	// Per-miner block template: coinbase "current miner" output goes to the given wallet
+	// instead of params.m_miningWallet. Used by StratumServer to pay each xmrig its own wallet.
+	BlockTemplate(SideChain* sidechain, RandomX_Hasher_Base* hasher, const Wallet& miner_wallet);
 	~BlockTemplate();
 
 	BlockTemplate(const BlockTemplate& b);
 	BlockTemplate& operator=(const BlockTemplate& b);
+
+	FORCEINLINE bool has_miner_wallet_override() const { return m_minerWalletOverride.valid(); }
+	FORCEINLINE const Wallet& miner_wallet_override() const { return m_minerWalletOverride; }
 
 	void update(const MinerData& data, const Mempool& mempool, const Params& params);
 	uint64_t last_updated() const { return m_lastUpdated.load(); }
@@ -115,6 +121,10 @@ private:
 #endif
 
 	std::atomic<uint64_t> m_finalReward;
+
+	// Invalid by default; when valid, update() uses this instead of params.m_miningWallet
+	// for the pool block's m_minerWallet and the tip coinbase output.
+	Wallet m_minerWalletOverride{ nullptr };
 
 	// Temp vectors, will be cleaned up after use and skipped in copy constructor/assignment operators
 	std::vector<uint8_t> m_minerTx;

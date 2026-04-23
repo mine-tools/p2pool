@@ -36,6 +36,12 @@ LOG_CATEGORY(BlockTemplate)
 
 namespace p2pool {
 
+BlockTemplate::BlockTemplate(SideChain* sidechain, RandomX_Hasher_Base* hasher, const Wallet& miner_wallet)
+	: BlockTemplate(sidechain, hasher)
+{
+	m_minerWalletOverride = miner_wallet;
+}
+
 BlockTemplate::BlockTemplate(SideChain* sidechain, RandomX_Hasher_Base* hasher)
 	: m_sidechain(sidechain)
 	, m_hasher(hasher)
@@ -138,6 +144,7 @@ BlockTemplate& BlockTemplate::operator=(const BlockTemplate& b)
 	m_timestamp = b.m_timestamp;
 	*m_poolBlockTemplate = *b.m_poolBlockTemplate;
 	m_finalReward = b.m_finalReward.load();
+	m_minerWalletOverride = b.m_minerWalletOverride;
 
 	m_minerTxKeccakState = b.m_minerTxKeccakState;
 	m_minerTxKeccakStateInputLength = b.m_minerTxKeccakStateInputLength;
@@ -269,7 +276,7 @@ void BlockTemplate::update(const MinerData& data, const Mempool& mempool, const 
 
 	m_blockHeaderSize = m_blockHeader.size();
 
-	m_poolBlockTemplate->m_minerWallet = params.m_miningWallet;
+	m_poolBlockTemplate->m_minerWallet = m_minerWalletOverride.valid() ? m_minerWalletOverride : params.m_miningWallet;
 
 	if (!m_sidechain->fill_sidechain_data(*m_poolBlockTemplate, m_shares)) {
 		use_old_template();
@@ -595,7 +602,7 @@ void BlockTemplate::update(const MinerData& data, const Mempool& mempool, const 
 		m_poolBlockTemplate->m_transactions.push_back(m_mempoolTxs[m_mempoolTxsOrder[i]].id);
 	}
 
-	m_poolBlockTemplate->m_minerWallet = params.m_miningWallet;
+	m_poolBlockTemplate->m_minerWallet = m_minerWalletOverride.valid() ? m_minerWalletOverride : params.m_miningWallet;
 
 	// Layout: [software id, version, random number, sidechain extra_nonce]
 	uint32_t* sidechain_extra = m_poolBlockTemplate->m_sidechainExtraBuf;
