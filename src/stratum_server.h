@@ -202,8 +202,10 @@ public:
 	// Look up the BlockTemplate for a wallet without touching ref_count. Returns nullptr if not cached.
 	[[nodiscard]] BlockTemplate* template_for(const Wallet& w) const;
 
-	// Fill short wallet label for logs ("4ABCDEFG...WXYZ1234" or "operator" fallback).
-	void format_wallet_short(const Wallet& w, char (&buf)[24]) const;
+	// Fill the full 95-character Monero address for logs (NUL-terminated, so the
+	// buffer must be ADDRESS_LENGTH + 1). Empty string when the wallet has not
+	// been assigned yet (e.g. pre-login).
+	void format_wallet(const Wallet& w, char (&buf)[Wallet::ADDRESS_LENGTH + 1]) const;
 
 private:
 
@@ -224,10 +226,9 @@ private:
 		raw_ip m_clientAddr;
 		char m_clientAddrString[Client::ADDR_STRING_SIZE];
 		char m_clientCustomUser[StratumClient::CUSTOM_USER_SIZE];
-		// Short form of the miner's wallet for logs: first 8 + "..." + last 8 chars,
-		// or "operator" when the client uses the pool-operator fallback wallet. Empty
-		// string when no wallet is attached yet (e.g. pre-login).
-		char m_clientWalletShort[24];
+		// Full 95-character Monero wallet address the miner's share pays to (NUL-terminated).
+		// Empty when no wallet is attached yet (e.g. pre-login).
+		char m_clientWallet[Wallet::ADDRESS_LENGTH + 1];
 		uint32_t m_clientResetCounter;
 		uint32_t m_rpcId;
 		uint32_t m_id;

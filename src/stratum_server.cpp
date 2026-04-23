@@ -207,23 +207,18 @@ bool StratumServer::is_our_wallet(const Wallet& w) const
 	return m_walletTemplates.find(wallet_key(w)) != m_walletTemplates.end();
 }
 
-void StratumServer::format_wallet_short(const Wallet& w, char (&buf)[24]) const
+void StratumServer::format_wallet(const Wallet& w, char (&buf)[Wallet::ADDRESS_LENGTH + 1]) const
 {
 	if (!w.valid()) {
 		buf[0] = '\0';
 		return;
 	}
-	if (w == m_pool->params().m_miningWallet) {
-		memcpy(buf, "operator", 9); // includes '\0'
-		return;
-	}
+	// Wallet::encode writes exactly ADDRESS_LENGTH chars with no terminator —
+	// we NUL-terminate so the buffer is usable with the log streams below.
 	char full[Wallet::ADDRESS_LENGTH];
 	w.encode(full);
-	// "XXXXXXXX...YYYYYYYY" (8 + 3 + 8 + '\0' = 20 bytes <= 24)
-	memcpy(buf, full, 8);
-	buf[8] = '.'; buf[9] = '.'; buf[10] = '.';
-	memcpy(buf + 11, full + Wallet::ADDRESS_LENGTH - 8, 8);
-	buf[19] = '\0';
+	memcpy(buf, full, Wallet::ADDRESS_LENGTH);
+	buf[Wallet::ADDRESS_LENGTH] = '\0';
 }
 
 void StratumServer::on_block(const BlockTemplate& block)
@@ -481,10 +476,10 @@ bool StratumServer::on_login(StratumClient* client, uint32_t id, const char* log
 		// Default log level (3) so the operator can see which wallet each miner
 		// bound to — this is the single source of truth for "where do this
 		// miner's shares go?". Logging at 0 would be too chatty on reconnect storms.
-		char wallet_short[24];
-		format_wallet_short(client->m_minerWallet, wallet_short);
+		char wallet_buf[Wallet::ADDRESS_LENGTH + 1];
+		format_wallet(client->m_minerWallet, wallet_buf);
 		LOGINFO(3, log::LightCyan() << "client " << log::Gray() << static_cast<char*>(client->m_addrString) << log::NoColor()
-			<< " logged in with wallet " << log::Green() << static_cast<const char*>(wallet_short));
+			<< " logged in with wallet " << log::Green() << static_cast<const char*>(wallet_buf));
 	}
 
 	uint32_t job_id;
@@ -605,8 +600,8 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 
 		if (mainchain_diff.check_pow(resultHash)) {
 			const char* s = client->m_customUser;
-			char w[24];
-			format_wallet_short(client->m_minerWallet, w);
+			char w[Wallet::ADDRESS_LENGTH + 1];
+			format_wallet(client->m_minerWallet, w);
 			LOGINFO(0, log::Green() << "client " << static_cast<char*>(client->m_addrString) << (*s ? " user " : "") << s << " wallet " << static_cast<const char*>(w) << " found a mainchain block at height " << height << ", submitting it");
 			// Pass tpl so submit_block() resolves template_id against the per-miner-wallet
 			// template — using the main template here would miss (template_id not found).
@@ -622,8 +617,8 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 			for (const AuxChainData& aux_data : aux_chains) {
 				if (aux_data.difficulty.check_pow(resultHash)) {
 					const char* s = client->m_customUser;
-					char w[24];
-					format_wallet_short(client->m_minerWallet, w);
+					char w[Wallet::ADDRESS_LENGTH + 1];
+					format_wallet(client->m_minerWallet, w);
 					LOGINFO(0, log::Green() << "client " << static_cast<char*>(client->m_addrString) << (*s ? " user " : "") << s << " wallet " << static_cast<const char*>(w) << " found an aux block for chain_id " << aux_data.unique_id << ", diff " << aux_data.difficulty << ", submitting it");
 					// Same per-wallet-template plumbing for aux submits so the merge-mining
 					// merkle proof matches the coinbase the miner actually hashed.
@@ -653,7 +648,7 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 		share.m_clientAddr = client->m_addr;
 		memcpy(share.m_clientAddrString, client->m_addrString, sizeof(share.m_clientAddrString));
 		memcpy(share.m_clientCustomUser, client->m_customUser, sizeof(share.m_clientCustomUser));
-		format_wallet_short(client->m_minerWallet, share.m_clientWalletShort);
+		format_wallet(client->m_minerWallet, share.m_clientWallet);
 		share.m_clientResetCounter = client->m_resetCounter.load();
 		share.m_rpcId = client->m_rpcId;
 		share.m_id = id;
@@ -764,13 +759,17 @@ void StratumServer::show_workers()
 
 	size_t n = 0;
 
+	// Full 95-char Monero address is displayed so the operator can copy/paste it
+	// straight into a block explorer. Pad to ADDRESS_LENGTH + 2 for a separator.
+	constexpr size_t WALLET_COL_W = Wallet::ADDRESS_LENGTH + 2;
+
 	LOGINFO(0, log::pad_right("IP:port", addr_len + 8)
 			<< "TLS    "
 			<< log::pad_right("uptime", 20)
 			<< log::pad_right("difficulty", 20)
 			<< log::pad_right("hashrate", 15)
 			<< log::pad_right("shares", 12)
-			<< log::pad_right("wallet", 22)
+			<< log::pad_right("wallet", WALLET_COL_W)
 			<< "name"
 	);
 
@@ -795,8 +794,8 @@ void StratumServer::show_workers()
 		log::Stream s(shares_buf);
 		s << c->m_sidechainShares << '/' << c->m_stratumShares << '\0';
 
-		char wallet_buf[24] = {};
-		format_wallet_short(c->m_minerWallet, wallet_buf);
+		char wallet_buf[Wallet::ADDRESS_LENGTH + 1] = {};
+		format_wallet(c->m_minerWallet, wallet_buf);
 
 		LOGINFO(0, log::pad_right(static_cast<const char*>(c->m_addrString), addr_len + 8)
 				<< (is_tls ? "yes    " : "no     ")
@@ -804,7 +803,7 @@ void StratumServer::show_workers()
 				<< log::pad_right(diff, 20)
 				<< log::pad_right(log::Hashrate(c->m_autoDiff.lo / AUTO_DIFF_TARGET_TIME, m_autoDiff && (c->m_autoDiff != 0)), 15)
 				<< log::pad_right(static_cast<const char*>(shares_buf), 12)
-				<< log::pad_right(*wallet_buf ? static_cast<const char*>(wallet_buf) : "-", 22)
+				<< log::pad_right(*wallet_buf ? static_cast<const char*>(wallet_buf) : "-", WALLET_COL_W)
 				<< (c->m_rpcId ? c->m_customUser : "not logged in")
 		);
 		++n;
@@ -1304,7 +1303,7 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 	bool share_found = false;
 
 	const char* s = share->m_clientCustomUser;
-	const char* w = share->m_clientWalletShort;
+	const char* w = share->m_clientWallet;
 
 	if (share->m_highEnoughDifficulty) {
 		if (share->m_result == SubmittedShare::Result::OK) {
