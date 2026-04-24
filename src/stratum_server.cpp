@@ -2016,7 +2016,8 @@ std::string StratumServer::build_wallet_stats_json(const char* wallet_filter) co
 
 	ReadLock lock(m_walletStatsLock);
 
-	log::Stream s;
+	char buf[log::Stream::BUF_SIZE];
+	log::Stream s(buf, sizeof(buf));
 
 	if (wallet_filter && *wallet_filter) {
 		// Single wallet query
@@ -2048,12 +2049,12 @@ std::string StratumServer::build_wallet_stats_json(const char* wallet_filter) co
 	return std::string(s.m_buf, s.m_pos);
 }
 
-void StratumServer::append_wallet_stats_json(log::Stream& s, const WalletStats& stats, uint64_t now) const
+void StratumServer::append_wallet_stats_json(log::Stream& s, const WalletStats& stats, uint64_t /* now */) const
 {
 	// Calculate hashrates for different time windows using cumulative ring buffer
 	const uint64_t head = stats.m_head;
 
-	auto calc_hashrate = [&](uint64_t tail_idx, uint64_t window_seconds) -> uint64_t {
+	auto calc_hashrate = [&](uint64_t tail_idx, uint64_t /* window_seconds */) -> uint64_t {
 		if (head <= tail_idx) return 0;
 
 		const WalletHashrateSample& head_sample = stats.m_ring[head % WalletStats::RING];

@@ -190,9 +190,6 @@ private:
 	mutable uv_rwlock_t m_walletTemplatesLock;
 	std::unordered_map<WalletKey, WalletTemplateEntry, WalletKeyHash> m_walletTemplates;
 
-	mutable uv_rwlock_t m_walletStatsLock;
-	std::unordered_map<WalletKey, WalletStats, WalletKeyHash> m_walletStats;
-
 	static WalletKey wallet_key(const Wallet& w) { return { w.spend_public_key(), w.view_public_key() }; }
 
 public:
@@ -310,6 +307,9 @@ private:
 			, m_lastActive(0)
 		{}
 	};
+
+	mutable uv_rwlock_t m_walletStatsLock;
+	std::unordered_map<WalletKey, WalletStats, WalletKeyHash> m_walletStats;
 
 	mutable uv_rwlock_t m_hashrateDataLock;
 
