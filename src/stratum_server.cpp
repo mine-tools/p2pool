@@ -1946,10 +1946,11 @@ void StratumServer::update_wallet_stats(const SubmittedShare* share)
 	check_event_loop_thread(__func__);
 
 	const uint64_t timestamp = share->m_timestamp;
-	const Wallet& wallet = share->m_minerWallet;
 
-	if (!wallet.valid()) {
-		return; // No wallet assigned
+	// Parse wallet from the client's wallet string
+	Wallet wallet;
+	if (!wallet.decode(share->m_clientWallet)) {
+		return; // Invalid wallet
 	}
 
 	const WalletKey key = wallet_key(wallet);
@@ -1960,7 +1961,8 @@ void StratumServer::update_wallet_stats(const SubmittedShare* share)
 
 	// Initialize address on first use
 	if (stats.m_address[0] == '\0') {
-		wallet.encode(stats.m_address);
+		memcpy(stats.m_address, share->m_clientWallet, Wallet::ADDRESS_LENGTH);
+		stats.m_address[Wallet::ADDRESS_LENGTH] = '\0';
 		stats.m_firstSeen = timestamp;
 	}
 
@@ -2022,8 +2024,15 @@ std::string StratumServer::build_wallet_stats_json(const char* wallet_filter) co
 	log::Stream s(buf, sizeof(buf));
 
 	if (wallet_filter && *wallet_filter) {
-		// Single wallet query
-		auto it = m_walletStats.find(wallet_filter);
+		// Single wallet query - need to parse the wallet string to create WalletKey
+		Wallet w;
+		if (!w.decode(wallet_filter)) {
+			s << "{\"error\":\"invalid wallet address\"}";
+			return std::string(s.m_buf, s.m_pos);
+		}
+
+		const WalletKey key = wallet_key(w);
+		auto it = m_walletStats.find(key);
 		if (it == m_walletStats.end()) {
 			s << "{\"error\":\"wallet not found\"}";
 			return std::string(s.m_buf, s.m_pos);
