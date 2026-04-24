@@ -1946,19 +1946,21 @@ void StratumServer::update_wallet_stats(const SubmittedShare* share)
 	check_event_loop_thread(__func__);
 
 	const uint64_t timestamp = share->m_timestamp;
-	const char* wallet = share->m_clientWallet;
+	const Wallet& wallet = share->m_minerWallet;
 
-	if (!wallet || !*wallet) {
+	if (!wallet.valid()) {
 		return; // No wallet assigned
 	}
 
+	const WalletKey key = wallet_key(wallet);
+
 	WriteLock lock(m_walletStatsLock);
 
-	WalletStats& stats = m_walletStats[wallet];
+	WalletStats& stats = m_walletStats[key];
 
 	// Initialize address on first use
 	if (stats.m_address[0] == '\0') {
-		memcpy(stats.m_address, wallet, Wallet::ADDRESS_LENGTH + 1);
+		wallet.encode(stats.m_address);
 		stats.m_firstSeen = timestamp;
 	}
 
@@ -2039,7 +2041,7 @@ std::string StratumServer::build_wallet_stats_json(const char* wallet_filter) co
 			if (!first) s << ",";
 			first = false;
 
-			s << "{\"wallet\":\"" << kv.first << "\",";
+			s << "{\"wallet\":\"" << kv.second.m_address << "\",";
 			append_wallet_stats_json(s, kv.second, now);
 			s << "}";
 		}
