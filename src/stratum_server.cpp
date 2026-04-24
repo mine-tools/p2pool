@@ -1948,8 +1948,8 @@ void StratumServer::update_wallet_stats(const SubmittedShare* share)
 	const uint64_t timestamp = share->m_timestamp;
 
 	// Parse wallet from the client's wallet string
-	Wallet wallet;
-	if (!wallet.decode(share->m_clientWallet)) {
+	Wallet wallet(share->m_clientWallet);
+	if (!wallet.valid()) {
 		return; // Invalid wallet
 	}
 
@@ -2025,8 +2025,8 @@ std::string StratumServer::build_wallet_stats_json(const char* wallet_filter) co
 
 	if (wallet_filter && *wallet_filter) {
 		// Single wallet query - need to parse the wallet string to create WalletKey
-		Wallet w;
-		if (!w.decode(wallet_filter)) {
+		Wallet w(wallet_filter);
+		if (!w.valid()) {
 			s << "{\"error\":\"invalid wallet address\"}";
 			return std::string(s.m_buf, s.m_pos);
 		}
