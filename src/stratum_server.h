@@ -63,7 +63,7 @@ public:
 		template<typename T> [[nodiscard]] bool process_login(T& doc, uint32_t id);
 		template<typename T> [[nodiscard]] bool process_submit(T& doc, uint32_t id);
 
-		bool send_http_response(bool send_content);
+		bool send_http_response(bool send_content, char* url_start, char* url_end);
 
 		alignas(8) char m_rawReadBuf[STRATUM_BUF_SIZE];
 
@@ -190,6 +190,9 @@ private:
 	mutable uv_rwlock_t m_walletTemplatesLock;
 	std::unordered_map<WalletKey, WalletTemplateEntry, WalletKeyHash> m_walletTemplates;
 
+	mutable uv_rwlock_t m_walletStatsLock;
+	std::unordered_map<WalletKey, WalletStats, WalletKeyHash> m_walletStats;
+
 	static WalletKey wallet_key(const Wallet& w) { return { w.spend_public_key(), w.view_public_key() }; }
 
 public:
@@ -244,6 +247,7 @@ private:
 		uint64_t m_timestamp;
 		uint64_t m_hashes;
 		bool m_highEnoughDifficulty;
+		bool m_isMainchainBlock;
 		int32_t m_score;
 
 		enum class Result {
@@ -260,6 +264,51 @@ private:
 	{
 		uint64_t m_timestamp;
 		uint64_t m_cumulativeHashes;
+	};
+
+	struct WalletHashrateSample
+	{
+		uint64_t m_timestamp;
+		uint64_t m_cumulativeHashes;
+		uint64_t m_cumulativeSharesDiff;
+		uint32_t m_cumulativeSharesCount;
+		uint32_t m_pad;
+	};
+
+	struct WalletStats
+	{
+		static constexpr size_t RING = 4096;
+		char m_address[Wallet::ADDRESS_LENGTH + 1];
+		WalletHashrateSample m_ring[RING];
+		uint64_t m_head;
+		uint64_t m_tail_5m, m_tail_15m, m_tail_1h, m_tail_6h, m_tail_24h;
+
+		uint64_t m_cumulativeHashes;
+		uint64_t m_cumulativeSharesDiff;
+		uint32_t m_cumulativeSharesCount;
+
+		uint32_t m_mainchainBlocksFound;
+		uint32_t m_sidechainSharesFound;
+		uint32_t m_sidechainSharesFailed;
+		uint32_t m_stratumShares;
+		uint64_t m_firstSeen;
+		uint64_t m_lastActive;
+
+		WalletStats()
+			: m_address{}
+			, m_ring{}
+			, m_head(0)
+			, m_tail_5m(0), m_tail_15m(0), m_tail_1h(0), m_tail_6h(0), m_tail_24h(0)
+			, m_cumulativeHashes(0)
+			, m_cumulativeSharesDiff(0)
+			, m_cumulativeSharesCount(0)
+			, m_mainchainBlocksFound(0)
+			, m_sidechainSharesFound(0)
+			, m_sidechainSharesFailed(0)
+			, m_stratumShares(0)
+			, m_firstSeen(0)
+			, m_lastActive(0)
+		{}
 	};
 
 	mutable uv_rwlock_t m_hashrateDataLock;
@@ -286,6 +335,10 @@ private:
 
 	void update_hashrate_data(uint64_t hashes, uint64_t timestamp);
 	void api_update_local_stats(uint64_t timestamp);
+
+	void update_wallet_stats(const SubmittedShare* share);
+	std::string build_wallet_stats_json(const char* wallet_filter) const;
+	void append_wallet_stats_json(log::Stream& s, const WalletStats& stats, uint64_t now) const;
 
 	void on_shutdown() override;
 };

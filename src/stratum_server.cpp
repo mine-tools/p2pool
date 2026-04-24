@@ -76,6 +76,7 @@ StratumServer::StratumServer(p2pool* pool)
 	uv_mutex_init_checked(&m_rngLock);
 	uv_rwlock_init_checked(&m_hashrateDataLock);
 	uv_rwlock_init_checked(&m_walletTemplatesLock);
+	uv_rwlock_init_checked(&m_walletStatsLock);
 
 	m_extraNonce = get_random32();
 
@@ -121,6 +122,7 @@ StratumServer::~StratumServer()
 	uv_mutex_destroy(&m_rngLock);
 	uv_rwlock_destroy(&m_hashrateDataLock);
 	uv_rwlock_destroy(&m_walletTemplatesLock);
+	uv_rwlock_destroy(&m_walletStatsLock);
 }
 
 BlockTemplate* StratumServer::template_for(const Wallet& w) const
@@ -662,6 +664,7 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 		share.m_sidechainHeight = sidechain_height;
 		share.m_effort = -1.0;
 		share.m_timestamp = seconds_since_epoch();
+		share.m_isMainchainBlock = mainchain_diff.check_pow(resultHash);
 
 		uint64_t rem;
 		share.m_hashes = (target > 1) ? udiv128(1, 0, target, &rem) : 1;
@@ -1339,6 +1342,11 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 		BACKGROUND_JOB_STOP(StratumServer::on_share_found);
 	}
 
+	// Update wallet stats for all accepted shares
+	if (share->m_result == SubmittedShare::Result::OK) {
+		server->update_wallet_stats(share);
+	}
+
 	const bool bad_share = (share->m_result == SubmittedShare::Result::LOW_DIFF) || (share->m_result == SubmittedShare::Result::INVALID_POW);
 
 	StratumClient* client = share->m_client;
@@ -1527,7 +1535,15 @@ bool StratumServer::StratumClient::on_read(const char* data, uint32_t size)
 
 					if (is_http_get || is_http_head) {
 						LOGINFO(5, "client " << log::Gray() << static_cast<const char*>(m_addrString) << log::NoColor() << " sent an HTTP " << (is_http_get ? "GET" : "HEAD") << " request");
-						send_http_response(is_http_get);
+
+						// Parse URL path
+						char* url_start = line_start + 4; // Skip "GET "
+						char* url_end = url_start;
+						while (url_end < c && *url_end != ' ' && *url_end != '?') {
+							++url_end;
+						}
+
+						send_http_response(is_http_get, url_start, url_end);
 						close();
 						return true;
 					}
@@ -1734,8 +1750,59 @@ bool StratumServer::StratumClient::process_submit(T& doc, uint32_t id)
 	return static_cast<StratumServer*>(m_owner)->on_submit(this, id, job_id.GetString(), nonce.GetString(), result.GetString());
 }
 
-bool StratumServer::StratumClient::send_http_response(bool send_content)
+bool StratumServer::StratumClient::send_http_response(bool send_content, char* url_start, char* url_end)
 {
+	StratumServer* server = static_cast<StratumServer*>(m_owner);
+
+	// Check if this is a /wallet_stats request
+	const size_t url_len = url_end - url_start;
+	if (url_len >= 13 && memcmp(url_start, "/wallet_stats", 13) == 0) {
+		// Extract wallet parameter if present
+		char* query_start = url_end;
+		while (*query_start != ' ' && *query_start != '\0' && *query_start != '\r' && *query_start != '\n') {
+			if (*query_start == '?') {
+				++query_start;
+				break;
+			}
+			++query_start;
+		}
+
+		const char* wallet_filter = nullptr;
+		char wallet_buf[Wallet::ADDRESS_LENGTH + 1] = {};
+
+		// Parse ?wallet= parameter
+		if (*query_start != ' ' && *query_start != '\0') {
+			const char* wallet_param = strstr(query_start, "wallet=");
+			if (wallet_param) {
+				wallet_param += 7; // Skip "wallet="
+				size_t i = 0;
+				while (i < Wallet::ADDRESS_LENGTH && wallet_param[i] != ' ' && wallet_param[i] != '&' && wallet_param[i] != '\0' && wallet_param[i] != '\r' && wallet_param[i] != '\n') {
+					wallet_buf[i] = wallet_param[i];
+					++i;
+				}
+				wallet_buf[i] = '\0';
+				wallet_filter = wallet_buf;
+			}
+		}
+
+		std::string json = server->build_wallet_stats_json(wallet_filter);
+
+		return m_owner->send(this, [send_content, json = std::move(json)](uint8_t *buf, size_t buf_size) -> size_t {
+			log::Stream s(buf, buf_size);
+			s << "HTTP/1.1 200 OK\r\n"
+			  << "Content-Length: " << json.size() << "\r\n"
+			  << "Content-Type: application/json\r\n"
+			  << "Connection: Closed\r\n\r\n";
+
+			if (send_content) {
+				s << json;
+			}
+
+			return s.m_pos;
+		});
+	}
+
+	// Default response
 	return m_owner->send(this, [send_content](uint8_t *buf, size_t buf_size) -> size_t {
 		static constexpr uint8_t data[] =
 			"HTTP/1.1 200 OK\r\n"
@@ -1872,6 +1939,149 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 			s	<< "]}";
 		});
 	});
+}
+
+void StratumServer::update_wallet_stats(const SubmittedShare* share)
+{
+	check_event_loop_thread(__func__);
+
+	const uint64_t timestamp = share->m_timestamp;
+	const char* wallet = share->m_clientWallet;
+
+	if (!wallet || !*wallet) {
+		return; // No wallet assigned
+	}
+
+	WriteLock lock(m_walletStatsLock);
+
+	WalletStats& stats = m_walletStats[wallet];
+
+	// Initialize address on first use
+	if (stats.m_address[0] == '\0') {
+		memcpy(stats.m_address, wallet, Wallet::ADDRESS_LENGTH + 1);
+		stats.m_firstSeen = timestamp;
+	}
+
+	stats.m_lastActive = timestamp;
+	++stats.m_stratumShares;
+
+	// Update cumulative counters
+	stats.m_cumulativeHashes += share->m_hashes;
+	stats.m_cumulativeSharesDiff += share->m_sidechainDifficulty.lo;
+	++stats.m_cumulativeSharesCount;
+
+	// Update ring buffer
+	const uint64_t head = stats.m_head;
+	WalletHashrateSample& sample = stats.m_ring[head % WalletStats::RING];
+
+	if (sample.m_timestamp == timestamp) {
+		// Same second, accumulate
+		sample.m_cumulativeHashes += share->m_hashes;
+		sample.m_cumulativeSharesDiff += share->m_sidechainDifficulty.lo;
+		++sample.m_cumulativeSharesCount;
+	} else {
+		// New second, advance head
+		const uint64_t new_head = head + 1;
+		stats.m_head = new_head;
+		WalletHashrateSample& new_sample = stats.m_ring[new_head % WalletStats::RING];
+		new_sample.m_timestamp = timestamp;
+		new_sample.m_cumulativeHashes = stats.m_cumulativeHashes;
+		new_sample.m_cumulativeSharesDiff = stats.m_cumulativeSharesDiff;
+		new_sample.m_cumulativeSharesCount = stats.m_cumulativeSharesCount;
+	}
+
+	// Update tail pointers for time windows
+	constexpr uint64_t windows[] = { 5*60, 15*60, 60*60, 6*60*60, 24*60*60 };
+	uint64_t* tails[] = { &stats.m_tail_5m, &stats.m_tail_15m, &stats.m_tail_1h, &stats.m_tail_6h, &stats.m_tail_24h };
+
+	for (int i = 0; i < 5; ++i) {
+		uint64_t& tail = *tails[i];
+		while ((tail < stats.m_head) && (stats.m_ring[tail % WalletStats::RING].m_timestamp + windows[i] < timestamp)) {
+			++tail;
+		}
+	}
+
+	// Update block/share counters
+	if (share->m_highEnoughDifficulty) {
+		++stats.m_sidechainSharesFound;
+		if (share->m_isMainchainBlock) {
+			++stats.m_mainchainBlocksFound;
+		}
+	}
+}
+
+std::string StratumServer::build_wallet_stats_json(const char* wallet_filter) const
+{
+	const uint64_t now = seconds_since_epoch();
+
+	ReadLock lock(m_walletStatsLock);
+
+	log::Stream s;
+
+	if (wallet_filter && *wallet_filter) {
+		// Single wallet query
+		auto it = m_walletStats.find(wallet_filter);
+		if (it == m_walletStats.end()) {
+			s << "{\"error\":\"wallet not found\"}";
+			return std::string(s.m_buf, s.m_pos);
+		}
+
+		const WalletStats& stats = it->second;
+		s << "{\"wallet\":\"" << wallet_filter << "\",";
+		append_wallet_stats_json(s, stats, now);
+		s << "}";
+	} else {
+		// All wallets
+		s << "{\"wallets\":[";
+		bool first = true;
+		for (const auto& kv : m_walletStats) {
+			if (!first) s << ",";
+			first = false;
+
+			s << "{\"wallet\":\"" << kv.first << "\",";
+			append_wallet_stats_json(s, kv.second, now);
+			s << "}";
+		}
+		s << "]}";
+	}
+
+	return std::string(s.m_buf, s.m_pos);
+}
+
+void StratumServer::append_wallet_stats_json(log::Stream& s, const WalletStats& stats, uint64_t now) const
+{
+	// Calculate hashrates for different time windows using cumulative ring buffer
+	const uint64_t head = stats.m_head;
+
+	auto calc_hashrate = [&](uint64_t tail_idx, uint64_t window_seconds) -> uint64_t {
+		if (head <= tail_idx) return 0;
+
+		const WalletHashrateSample& head_sample = stats.m_ring[head % WalletStats::RING];
+		const WalletHashrateSample& tail_sample = stats.m_ring[tail_idx % WalletStats::RING];
+
+		const uint64_t hashes = head_sample.m_cumulativeHashes - tail_sample.m_cumulativeHashes;
+		const uint64_t time_diff = head_sample.m_timestamp - tail_sample.m_timestamp;
+
+		return (time_diff > 0) ? (hashes / time_diff) : 0;
+	};
+
+	const uint64_t hr_5m = calc_hashrate(stats.m_tail_5m, 5*60);
+	const uint64_t hr_15m = calc_hashrate(stats.m_tail_15m, 15*60);
+	const uint64_t hr_1h = calc_hashrate(stats.m_tail_1h, 60*60);
+	const uint64_t hr_6h = calc_hashrate(stats.m_tail_6h, 6*60*60);
+	const uint64_t hr_24h = calc_hashrate(stats.m_tail_24h, 24*60*60);
+
+	s << "\"hashrate_5m\":" << hr_5m
+	  << ",\"hashrate_15m\":" << hr_15m
+	  << ",\"hashrate_1h\":" << hr_1h
+	  << ",\"hashrate_6h\":" << hr_6h
+	  << ",\"hashrate_24h\":" << hr_24h
+	  << ",\"total_hashes\":" << stats.m_cumulativeHashes
+	  << ",\"shares_count\":" << stats.m_cumulativeSharesCount
+	  << ",\"mainchain_blocks_found\":" << stats.m_mainchainBlocksFound
+	  << ",\"sidechain_shares_found\":" << stats.m_sidechainSharesFound
+	  << ",\"first_seen\":" << stats.m_firstSeen
+	  << ",\"last_active\":" << stats.m_lastActive;
 }
 
 } // namespace p2pool
