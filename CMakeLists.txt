@@ -127,6 +127,7 @@ set(HEADERS
 	src/side_chain.h
 	src/stratum_server.h
 	src/tcp_server.h
+	src/tor.h
 	src/util.h
 	src/uv_util.h
 	src/wallet.h
@@ -400,7 +401,7 @@ if (HAVE_GLIBC)
 	add_definitions(-DHAVE_GLIBC)
 endif()
 
-add_definitions("-DRAPIDJSON_PARSE_DEFAULT_FLAGS=kParseTrailingCommasFlag")
+add_definitions("-DRAPIDJSON_PARSE_DEFAULT_FLAGS=(kParseTrailingCommasFlag|kParseIterativeFlag)")
 
 if (WIN32 AND (CMAKE_BUILD_TYPE STREQUAL "Release"))
 	add_definitions(-DNDEBUG)

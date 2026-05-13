@@ -1,16 +1,19 @@
 #!/bin/sh
+set -u
 set -e
 
 # Software versions to install
 
-_7ZIP_VERSION=2600
+APT_SNAPSHOT=20260507T000000Z
+_7ZIP_VERSION_MAJOR=26
+_7ZIP_VERSION_MINOR=01
 BINUTILS_VERSION=2_46
 CLANG_VERSION=21.1.8
-CMAKE_VERSION=4.3.1
+CMAKE_VERSION=4.3.2
 FREEBSD_VERSION=12.4
-GCC_VERSION=15.2.0
+GCC_VERSION=16.1.0
 GLIBC_VERSION=2.43
-LINUX_HEADERS_VERSION=6.19.12
+LINUX_HEADERS_VERSION=6.19.14
 MACOSX_SDK_VERSION=26.1
 OSXCROSS_VERSION=2bc739ebe45db5d72e176d2a4e1c7dd95464e8e2
 MAKE_VERSION=4.4.1
@@ -18,12 +21,12 @@ MINGW_VERSION=14.0.0
 XZ_VERSION=5.8.3
 TAR_VERSION=1.35
 
-_7ZIP_SHA256="c74dc4a48492cde43f5fec10d53fb2a66f520e4a62a69d630c44cb22c477edc6"
-CMAKE_SHA256="208d76804009cbe8ec9aea0aa052c857c6e59bd289b43b9941c99324dc78b1d8"
+_7ZIP_SHA256="8ea0fc8a135e7b848e80a4116fe22dff56c8c4518dde1f43cce67f4e340b437a"
+CMAKE_SHA256="791ae3604841ca03cb3889a3ad89165346e4b180ae3448efd4b0caa9ef46d245"
 FREEBSD_AARCH64_SHA256="6c401819bfb93e810c9f9aa670a1e4685f924df5e7e0c9c6397dd6c16c954fa2"
 FREEBSD_X86_64_SHA256="581c7edacfd2fca2bdf5791f667402d22fccd8a5e184635e0cac075564d57aa8"
 GLIBC_SHA256="d9c86c6b5dbddb43a3e08270c5844fc5177d19442cf5b8df4be7c07cd5fa3831"
-HEADERS_SHA256="ce5c4f1205f9729286b569b037649591555f31ca1e03cc504bd3b70b8e58a8d5"
+HEADERS_SHA256="cde8bf6739be4a0777fedbbba5330b8188c55680c45a922a4dfa289cbec6f185"
 MACOSX_SDK_SHA256="beee7212d265a6d2867d0236cc069314b38d5fb3486a6515734e76fa210c784c"
 MAKE_SHA256="dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3"
 TAR_SHA256="4d62ff37342ec7aed748535323930c7cf94acf71c3591882b26a7ea50f3edc16"
@@ -32,13 +35,19 @@ echo "Install prerequisites"
 
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update && apt-get upgrade -yq --no-install-recommends
-apt-get install -yq --no-install-recommends ca-certificates curl bzip2 flex texinfo bison ninja-build python3 python3-yaml file rsync xz-utils gawk gettext patch git gcc g++
+apt-get update
+apt-get install -yq --no-install-recommends ca-certificates
+
+echo "APT::Snapshot \"$APT_SNAPSHOT\";" > /etc/apt/apt.conf.d/50snapshot
+
+apt-get update
+apt-get install -yq --no-install-recommends curl bzip2 flex texinfo bison ninja-build python3 python3-yaml file rsync xz-utils gawk gettext patch git gcc g++
 
 echo "Cloning the P2Pool repository in background"
 
 cd /
 git clone --recursive --jobs $(nproc) https://github.com/SChernykh/p2pool &
+P2POOL_CLONE_PID=$!
 
 echo "Download archives"
 
@@ -47,7 +56,7 @@ cd /root
 MAKE_NAME=make-$MAKE_VERSION
 MAKE_FILE=$MAKE_NAME.tar.gz
 
-_7ZIP_FILE=7z$_7ZIP_VERSION-linux-x64.tar.xz
+_7ZIP_FILE=7z$_7ZIP_VERSION_MAJOR$_7ZIP_VERSION_MINOR-linux-x64.tar.xz
 
 CMAKE_NAME=cmake-$CMAKE_VERSION-linux-x86_64
 CMAKE_FILE=$CMAKE_NAME.tar.gz
@@ -67,7 +76,7 @@ mkdir /usr/local/cross-freebsd-aarch64
 
 curl -L -Z \
 -O https://ftpmirror.gnu.org/make/$MAKE_FILE \
--O https://7-zip.org/a/$_7ZIP_FILE \
+-O https://github.com/ip7z/7zip/releases/download/$_7ZIP_VERSION_MAJOR.$_7ZIP_VERSION_MINOR/$_7ZIP_FILE \
 -O https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/$CMAKE_FILE \
 -O https://www.kernel.org/pub/linux/kernel/v6.x/$HEADERS_FILE \
 -O https://ftpmirror.gnu.org/glibc/$GLIBC_FILE \
@@ -82,42 +91,42 @@ cd /root
 
 MAKE_FILE_SHA256="$(sha256sum $MAKE_FILE | awk '{ print $1 }')"
 
-if [ $MAKE_FILE_SHA256 != $MAKE_SHA256 ]; then
+if [ "$MAKE_FILE_SHA256" != "$MAKE_SHA256" ]; then
     echo "Error: SHA256 sum does not match for $MAKE_FILE - expected $MAKE_SHA256, got $MAKE_FILE_SHA256"
     exit 1
 fi
 
 _7ZIP_FILE_SHA256="$(sha256sum $_7ZIP_FILE | awk '{ print $1 }')"
 
-if [ $_7ZIP_FILE_SHA256 != $_7ZIP_SHA256 ]; then
+if [ "$_7ZIP_FILE_SHA256" != "$_7ZIP_SHA256" ]; then
     echo "Error: SHA256 sum does not match for $_7ZIP_FILE - expected $_7ZIP_SHA256, got $_7ZIP_FILE_SHA256"
     exit 1
 fi
 
 CMAKE_FILE_SHA256="$(sha256sum $CMAKE_FILE | awk '{ print $1 }')"
 
-if [ $CMAKE_FILE_SHA256 != $CMAKE_SHA256 ]; then
+if [ "$CMAKE_FILE_SHA256" != "$CMAKE_SHA256" ]; then
     echo "Error: SHA256 sum does not match for $CMAKE_FILE - expected $CMAKE_SHA256, got $CMAKE_FILE_SHA256"
     exit 1
 fi
 
 HEADERS_FILE_SHA256="$(sha256sum $HEADERS_FILE | awk '{ print $1 }')"
 
-if [ $HEADERS_FILE_SHA256 != $HEADERS_SHA256 ]; then
+if [ "$HEADERS_FILE_SHA256" != "$HEADERS_SHA256" ]; then
     echo "Error: SHA256 sum does not match for $HEADERS_FILE - expected $HEADERS_SHA256, got $HEADERS_FILE_SHA256"
     exit 1
 fi
 
 GLIBC_FILE_SHA256="$(sha256sum $GLIBC_FILE | awk '{ print $1 }')"
 
-if [ $GLIBC_FILE_SHA256 != $GLIBC_SHA256 ]; then
+if [ "$GLIBC_FILE_SHA256" != "$GLIBC_SHA256" ]; then
     echo "Error: SHA256 sum does not match for $GLIBC_FILE - expected $GLIBC_SHA256, got $GLIBC_FILE_SHA256"
     exit 1
 fi
 
 MACOSX_SDK_FILE_SHA256="$(sha256sum $MACOSX_SDK_FILE | awk '{ print $1 }')"
 
-if [ $MACOSX_SDK_FILE_SHA256 != $MACOSX_SDK_SHA256 ]; then
+if [ "$MACOSX_SDK_FILE_SHA256" != "$MACOSX_SDK_SHA256" ]; then
     echo "Error: SHA256 sum does not match for $MACOSX_SDK_FILE - expected $MACOSX_SDK_SHA256, got $MACOSX_SDK_FILE_SHA256"
     exit 1
 fi
@@ -126,7 +135,7 @@ cd /usr/local/cross-freebsd-x86_64
 
 FREEBSD_X86_64_FILE_SHA256="$(sha256sum $FREEBSD_FILE | awk '{ print $1 }')"
 
-if [ $FREEBSD_X86_64_FILE_SHA256 != $FREEBSD_X86_64_SHA256 ]; then
+if [ "$FREEBSD_X86_64_FILE_SHA256" != "$FREEBSD_X86_64_SHA256" ]; then
     echo "Error: SHA256 sum does not match for $FREEBSD_FILE - expected $FREEBSD_X86_64_SHA256, got $FREEBSD_X86_64_FILE_SHA256"
     exit 1
 fi
@@ -135,7 +144,7 @@ cd /usr/local/cross-freebsd-aarch64
 
 FREEBSD_AARCH64_FILE_SHA256="$(sha256sum $FREEBSD_FILE | awk '{ print $1 }')"
 
-if [ $FREEBSD_AARCH64_FILE_SHA256 != $FREEBSD_AARCH64_SHA256 ]; then
+if [ "$FREEBSD_AARCH64_FILE_SHA256" != "$FREEBSD_AARCH64_SHA256" ]; then
     echo "Error: SHA256 sum does not match for $FREEBSD_FILE - expected $FREEBSD_AARCH64_SHA256, got $FREEBSD_AARCH64_FILE_SHA256"
     exit 1
 fi
@@ -144,7 +153,7 @@ cd /root
 
 TAR_FILE_SHA256="$(sha256sum $TAR_FILE | awk '{ print $1 }')"
 
-if [ $TAR_FILE_SHA256 != $TAR_SHA256 ]; then
+if [ "$TAR_FILE_SHA256" != "$TAR_SHA256" ]; then
     echo "Error: SHA256 sum does not match for $TAR_FILE - expected $TAR_SHA256, got $TAR_FILE_SHA256"
     exit 1
 fi
@@ -153,8 +162,8 @@ echo "Cloning repositories"
 
 cd /root
 
-git clone --depth 1 --branch releases/gcc-$GCC_VERSION git://gcc.gnu.org/git/gcc.git
-git clone --depth 1 --branch binutils-$BINUTILS_VERSION git://sourceware.org/git/binutils-gdb.git
+git clone --depth 1 --branch releases/gcc-$GCC_VERSION https://gcc.gnu.org/git/gcc.git
+git clone --depth 1 --branch binutils-$BINUTILS_VERSION https://sourceware.org/git/binutils-gdb.git
 git clone --depth 1 --branch llvmorg-$CLANG_VERSION https://github.com/llvm/llvm-project.git
 git clone --depth=1 --branch v$MINGW_VERSION https://git.code.sf.net/p/mingw-w64/mingw-w64 mingw-w64-v$MINGW_VERSION
 git clone --branch 2.0-llvm-based https://github.com/tpoechtrager/osxcross
@@ -269,7 +278,7 @@ echo "Install GCC for aarch64-linux-gnu"
 cd /root
 
 mkdir gcc_build_aarch64 && cd gcc_build_aarch64
-../gcc/configure --target=aarch64-linux-gnu --enable-languages=c,c++ --disable-multilib
+../gcc/configure --target=aarch64-linux-gnu --enable-languages=c,c++ --disable-multilib --disable-libatomic
 make -j$(nproc) all-gcc
 make install-gcc
 
@@ -321,7 +330,7 @@ echo "Install GCC for riscv64-linux-gnu"
 cd /root
 
 mkdir gcc_build_riscv64 && cd gcc_build_riscv64
-../gcc/configure --target=riscv64-linux-gnu --enable-languages=c,c++ --disable-multilib
+../gcc/configure --target=riscv64-linux-gnu --enable-languages=c,c++ --disable-multilib --disable-libatomic
 make -j$(nproc) all-gcc
 make install-gcc
 
@@ -380,7 +389,7 @@ echo "Install GCC for x86_64-w64-mingw32"
 cd /root
 
 mkdir gcc_build_w64 && cd gcc_build_w64
-../gcc/configure --target=x86_64-w64-mingw32 --enable-languages=c,c++ --disable-multilib
+../gcc/configure --target=x86_64-w64-mingw32 --enable-languages=c,c++ --disable-multilib --disable-libatomic
 make -j$(nproc) all-gcc
 make install-gcc
 
@@ -403,12 +412,19 @@ cd /root/gcc_build_w64
 make -j$(nproc) all-target-libstdc++-v3
 make install-target-libstdc++-v3
 
+echo "Install Linux headers for x86_64-pc-linux-gnu"
+
+cd /root
+
+cd /root/linux-$LINUX_HEADERS_VERSION
+make ARCH=x86_64 INSTALL_HDR_PATH=/usr/local/x86_64-pc-linux-gnu headers_install
+
 echo "Install glibc for x86_64-pc-linux-gnu"
 
 cd /root
 
 mkdir glibc_build_x86_64 && cd glibc_build_x86_64
-CFLAGS='-O2' ../glibc-$GLIBC_VERSION/configure --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --prefix=/usr/local/x86_64-pc-linux-gnu --disable-multilib --enable-static-nss
+CFLAGS='-O2' ../glibc-$GLIBC_VERSION/configure --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --prefix=/usr/local/x86_64-pc-linux-gnu --with-headers=/usr/local/x86_64-pc-linux-gnu/include --disable-multilib --enable-static-nss
 make -j$(nproc) install-bootstrap-headers=yes install-headers
 make -j$(nproc) csu/subdir_lib
 
@@ -449,7 +465,7 @@ cd /root
 
 cd xz
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang
+cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
 cp -f lzma* /usr/bin
@@ -461,7 +477,7 @@ cd /root
 
 tar xvf $TAR_FILE
 cd tar-$TAR_VERSION
-FORCE_UNSAFE_CONFIGURE=1 ./configure
+FORCE_UNSAFE_CONFIGURE=1 CFLAGS='-O2' ./configure
 make -j$(nproc)
 make install
 
@@ -472,9 +488,14 @@ rm /usr/lib/x86_64-linux-gnu/crti.o
 rm /usr/lib/x86_64-linux-gnu/crtn.o
 rm /usr/lib/x86_64-linux-gnu/libc.a
 
+echo "Waiting for P2Pool git clone to finish"
+wait $P2POOL_CLONE_PID
+
 echo "Deleting temporary files"
 
-cd /root
-rm -rf *
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+rm -rf /root/*
+rm -rf /tmp/*
 
 echo "All done"

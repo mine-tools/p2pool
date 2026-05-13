@@ -56,11 +56,17 @@ static constexpr uint64_t MAX_BLOCK_SIZE = 128 * 1024 - 5;
 // 0.6 XMR
 static constexpr uint64_t BASE_BLOCK_REWARD = 600000000000ULL;
 
+// Because these values are stored in a 56 bit field
+static constexpr uint64_t MAX_OUTPUT_VALUE = (1ULL << 56) - 1;
+
 // 1000 years at 1 TH/s. It should be enough for any normal use.
 static constexpr difficulty_type MAX_CUMULATIVE_DIFFICULTY{ 13019633956666736640ULL, 1710ULL };
 
 // 1000 years at 1 block/second. It should be enough for any normal use.
 static constexpr uint64_t MAX_SIDECHAIN_HEIGHT = 31556952000ULL;
+
+// Taken from Monero's cryptonote_config.h
+static constexpr uint64_t CRYPTONOTE_MAX_BLOCK_NUMBER = 500000000ULL;
 
 // Limited by the format of the Merkle tree parameters in tx_extra
 static constexpr uint64_t MERGE_MINING_MAX_CHAINS = 256;
@@ -140,7 +146,6 @@ struct PoolBlock
 
 	// Merkle proof for merge mining
 	std::vector<hash> m_merkleProof;
-	uint32_t m_merkleProofPath;
 
 	// Merge mining extra data
 	//

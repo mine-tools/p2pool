@@ -51,7 +51,6 @@ PoolBlock::PoolBlock()
 	, m_difficulty{}
 	, m_cumulativeDifficulty{}
 	, m_merkleProof{}
-	, m_merkleProofPath(0)
 	, m_mergeMiningExtra{}
 	, m_sidechainExtraBuf{}
 	, m_sidechainId{}
@@ -108,7 +107,6 @@ PoolBlock& PoolBlock::operator=(const PoolBlock& b)
 	m_difficulty = b.m_difficulty;
 	m_cumulativeDifficulty = b.m_cumulativeDifficulty;
 	m_merkleProof = b.m_merkleProof;
-	m_merkleProofPath = b.m_merkleProofPath;
 	m_mergeMiningExtra = b.m_mergeMiningExtra;
 	memcpy(m_sidechainExtraBuf, b.m_sidechainExtraBuf, sizeof(m_sidechainExtraBuf));
 	m_sidechainId = b.m_sidechainId;
@@ -139,6 +137,11 @@ PoolBlock& PoolBlock::operator=(const PoolBlock& b)
 
 std::vector<uint8_t> PoolBlock::serialize_mainchain_data(size_t* header_size, size_t* miner_tx_size, int* outputs_offset, int* outputs_blob_size, const uint32_t* nonce, const uint32_t* extra_nonce) const
 {
+	if (m_transactions.empty()) {
+		LOGERR(1, "Trying to serialize an uninitialized block, fix the code!");
+		return {};
+	}
+
 	std::vector<uint8_t> data;
 	data.reserve(std::min<size_t>(128 + m_outputAmounts.size() * 39 + m_transactions.size() * HASH_SIZE, 131072));
 
@@ -200,7 +203,7 @@ std::vector<uint8_t> PoolBlock::serialize_mainchain_data(size_t* header_size, si
 	}
 
 	*(p++) = TX_EXTRA_NONCE;
-	*(p++) = static_cast<uint8_t>(extra_nonce_size);
+	writeVarint(extra_nonce_size, [&p](uint8_t value) { *(p++) = value; });
 
 	if (!extra_nonce) {
 		extra_nonce = &m_extraNonce;
@@ -343,6 +346,11 @@ void PoolBlock::reset_offchain_data()
 
 bool PoolBlock::get_pow_hash(RandomX_Hasher_Base* hasher, uint64_t height, const hash& seed_hash, hash& pow_hash, bool force_light_mode)
 {
+	if (m_transactions.empty()) {
+		LOGERR(1, "Trying to calculate PoW hash of an uninitialized block, fix the code!");
+		return false;
+	}
+
 	// Calculate the coinbase tx hash, then the merkle root of all transactions in the block - this merkle root is what goes into the hashing blob
 
 	// Monero transactions are hashed in 3 separate parts, the resulting 3 hashes are then hashed together to get the final result

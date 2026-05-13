@@ -33,6 +33,16 @@ TEST(hash, constructor)
 	memset(h.h, -1, HASH_SIZE);
 	h = {};
 	ASSERT_EQ(memcmp(h.h, buf, HASH_SIZE), 0);
+
+	hash h2{ "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" };
+	for (uint8_t i = 0; i < HASH_SIZE; ++i) {
+		ASSERT_EQ(h2.h[i], i);
+	}
+
+	hash h3{ "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F" };
+	for (uint8_t i = 0; i < HASH_SIZE; ++i) {
+		ASSERT_EQ(h3.h[i], i);
+	}
 }
 
 TEST(hash, compare)

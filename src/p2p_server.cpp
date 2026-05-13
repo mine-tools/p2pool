@@ -66,6 +66,8 @@ static constexpr hash seed_onion_nodes[] = {
 };
 
 static constexpr hash seed_i2p_nodes[] = {
+	from_i2p_b32_const("p2pseeds2ggmpw62wdua6ll27awcndorshcg7nsbinc5xlhp6tqa.b32.i2p"),
+	from_i2p_b32_const("p2pse3irgfuks5eazbcwkcijsv6u3qtffl6zudct4t4kn2sinotq.b32.i2p"),
 	from_i2p_b32_const("h6jrh53yvlvzqqyy7abzjp2t4kidtheee7e7nfbynecroc7yvbjq.b32.i2p")
 };
 
@@ -101,8 +103,10 @@ P2PServer::P2PServer(p2pool* pool)
 	// Diffuse the initial state in case it has low quality
 	m_rng.discard(10000);
 
-	m_peerId = m_rng();
-	m_peerId_TOR = m_rng();
+	// Make sure peer IDs are not 0
+	do { m_peerId     = m_rng(); } while (!m_peerId);
+	do { m_peerId_TOR = m_rng(); } while (!m_peerId_TOR);
+	do { m_peerId_I2P = m_rng(); } while (!m_peerId_I2P);
 
 	const Params& params = pool->params();
 
@@ -795,14 +799,16 @@ void P2PServer::load_peer_list()
 	std::vector<std::string> paths;
 	paths.resize(Params::ProxyType::MAX);
 
-	paths[Params::ProxyType::PLAIN] = saved_peer_list_file_name;
+	const Params& params = m_pool->params();
+
+	paths[Params::ProxyType::PLAIN] = params.m_dataDir + saved_peer_list_file_name;
 
 	if (!m_socks5Proxy.empty() && (m_socks5ProxyType == Params::ProxyType::TOR)) {
-		paths[Params::ProxyType::TOR] = saved_onion_peer_list_file_name;
+		paths[Params::ProxyType::TOR] = params.m_dataDir + saved_onion_peer_list_file_name;
 	}
 
 	if (!m_socks5Proxy.empty() && (m_socks5ProxyType == Params::ProxyType::I2P)) {
-		paths[Params::ProxyType::I2P] = saved_i2p_peer_list_file_name;
+		paths[Params::ProxyType::I2P] = params.m_dataDir + saved_i2p_peer_list_file_name;
 	}
 
 	for (int i = Params::ProxyType::PLAIN; i < Params::ProxyType::MAX; ++i) {
@@ -891,6 +897,10 @@ void P2PServer::load_peer_list()
 
 void P2PServer::load_monerod_peer_list()
 {
+	if (m_pool->params().m_noClearnetP2P) {
+		return;
+	}
+
 	const Params::Host& host = m_pool->current_host();
 
 	JSONRPCRequest::call(host.m_address, host.m_rpcPort, "/get_peer_list", host.m_rpcLogin, m_socks5Proxy, host.m_rpcSSL, host.m_rpcSSL_Fingerprint,
@@ -2102,7 +2112,7 @@ bool P2PServer::P2PClient::on_read(const char* data, uint32_t size)
 		const MessageId id = static_cast<MessageId>(buf[0]);
 
 		// Peer must complete the handshake challenge before sending any other messages
-		if (!m_handshakeComplete && (id != m_expectedMessage)) {
+		if ((!m_handshakeComplete || m_handshakeInvalid) && (id != m_expectedMessage)) {
 			LOGWARN(5, "peer " << static_cast<char*>(m_addrString) << " didn't send handshake messages first");
 			ban(DEFAULT_BAN_TIME);
 			server->remove_peer_from_list(this);
@@ -2206,6 +2216,14 @@ bool P2PServer::P2PClient::on_read(const char* data, uint32_t size)
 
 			if (bytes_left >= 1 + sizeof(uint32_t)) {
 				const uint32_t block_size = read_unaligned(reinterpret_cast<uint32_t*>(buf + 1));
+
+				if (block_size > MAX_BLOCK_SIZE) {
+					LOGWARN(4, "peer " << static_cast<char*>(m_addrString) << " sent too big BLOCK_RESPONSE");
+					ban(DEFAULT_BAN_TIME);
+					server->remove_peer_from_list(this);
+					return false;
+				}
+
 				if (bytes_left >= 1 + sizeof(uint32_t) + block_size) {
 					bytes_read = 1 + sizeof(uint32_t) + block_size;
 
@@ -2229,6 +2247,14 @@ bool P2PServer::P2PClient::on_read(const char* data, uint32_t size)
 
 				if (bytes_left >= 1 + sizeof(uint32_t)) {
 					const uint32_t block_size = read_unaligned(reinterpret_cast<uint32_t*>(buf + 1));
+
+					if (block_size > MAX_BLOCK_SIZE) {
+						LOGWARN(4, "peer " << static_cast<char*>(m_addrString) << " sent too big " << (compact ? "BLOCK_BROADCAST_COMPACT" : "BLOCK_BROADCAST"));
+						ban(DEFAULT_BAN_TIME);
+						server->remove_peer_from_list(this);
+						return false;
+					}
+
 					if (bytes_left >= 1 + sizeof(uint32_t) + block_size) {
 						bytes_read = 1 + sizeof(uint32_t) + block_size;
 						if (!on_block_broadcast(buf + 1 + sizeof(uint32_t), block_size, compact)) {
@@ -2299,6 +2325,14 @@ bool P2PServer::P2PClient::on_read(const char* data, uint32_t size)
 
 			if (bytes_left >= 1 + sizeof(uint32_t)) {
 				const uint32_t msg_size = read_unaligned(reinterpret_cast<uint32_t*>(buf + 1));
+
+				if (msg_size > MAX_BLOCK_SIZE) {
+					LOGWARN(4, "peer " << static_cast<char*>(m_addrString) << " sent too big AUX_JOB_DONATION");
+					ban(DEFAULT_BAN_TIME);
+					server->remove_peer_from_list(this);
+					return false;
+				}
+
 				if (bytes_left >= 1 + sizeof(uint32_t) + msg_size) {
 					bytes_read = 1 + sizeof(uint32_t) + msg_size;
 
@@ -2316,6 +2350,14 @@ bool P2PServer::P2PClient::on_read(const char* data, uint32_t size)
 
 			if (bytes_left >= 1 + sizeof(uint32_t)) {
 				const uint32_t msg_size = read_unaligned(reinterpret_cast<uint32_t*>(buf + 1));
+
+				if (msg_size > MAX_BLOCK_SIZE) {
+					LOGWARN(4, "peer " << static_cast<char*>(m_addrString) << " sent too big MONERO_BLOCK_BROADCAST");
+					ban(DEFAULT_BAN_TIME);
+					server->remove_peer_from_list(this);
+					return false;
+				}
+
 				if (bytes_left >= 1 + sizeof(uint32_t) + msg_size) {
 					bytes_read = 1 + sizeof(uint32_t) + msg_size;
 
@@ -2396,7 +2438,17 @@ bool P2PServer::P2PClient::send_handshake_challenge()
 				k >>= 8;
 			}
 
-			k = owner->get_peerId((m_addressType == AddressType::DomainName) && (strstr(m_addrString, ".onion:")));
+			bool is_tor = false;
+
+			if (((m_addressType == AddressType::DomainName) && (strstr(m_addrString, ".onion:"))) ||
+			    (!owner->m_pool->params().m_onionPubkey.empty() && m_isIncoming && (m_addressType != AddressType::DomainName) && m_addr.is_localhost()))
+			{
+				// 1) We're connecting to an .onion address
+				// 2) We published our .onion address, and it's an incoming connection on localhost interface, so it's likely an incoming tor connection
+				is_tor = true;
+			}
+
+			k = owner->get_peerId(is_tor, owner->m_isI2P);
 			memcpy(p, &k, sizeof(uint64_t));
 			p += sizeof(uint64_t);
 
@@ -2589,7 +2641,7 @@ bool P2PServer::P2PClient::on_handshake_challenge(const uint8_t* buf)
 	uint64_t peer_id;
 	memcpy(&peer_id, buf + CHALLENGE_SIZE, sizeof(uint64_t));
 
-	if ((peer_id == server->get_peerId(false)) || (peer_id == server->get_peerId(true))) {
+	if ((peer_id == server->m_peerId) || (peer_id == server->m_peerId_TOR) || (peer_id == server->m_peerId_I2P)) {
 		LOGWARN(5, "tried to connect to self at " << static_cast<const char*>(m_addrString));
 		return false;
 	}
@@ -2687,7 +2739,7 @@ bool P2PServer::P2PClient::on_listen_port(const uint8_t* buf)
 	int32_t port;
 	memcpy(&port, buf, sizeof(port));
 
-	if ((port < 0) || (port >= 65536)) {
+	if ((port <= 0) || (port >= 65536)) {
 		LOGWARN(5, "peer " << static_cast<char*>(m_addrString) << " sent an invalid listen port number");
 		return false;
 	}
@@ -3017,7 +3069,8 @@ void P2PServer::P2PClient::on_peer_list_response(const uint8_t* buf)
 						m_protocolVersion = PROTOCOL_VERSION_1_0;
 					}
 					else {
-						m_protocolVersion = std::min(version, SUPPORTED_PROTOCOL_VERSION);
+						// Don't allow version downgrades
+						m_protocolVersion = std::max(m_protocolVersion, std::min(version, SUPPORTED_PROTOCOL_VERSION));
 					}
 
 					m_SoftwareVersion = *reinterpret_cast<uint32_t*>(ip.data + 4);
@@ -3089,8 +3142,16 @@ void P2PServer::P2PClient::on_block_notify(const uint8_t* buf)
 			return;
 		}
 
-		if (!server->m_blockNotifyRequests.insert(*id.u64()).second || !server->m_missingBlockRequests.emplace(m_peerId, *id.u64()).second) {
+		const uint64_t id64 = *id.u64();
+
+		// First check these two, then update them only after a successful send
+		if (server->m_blockNotifyRequests.find(id64) != server->m_blockNotifyRequests.end()) {
 			LOGINFO(6, "BLOCK_REQUEST for id = " << id << " was already sent");
+			return;
+		}
+
+		if (server->m_missingBlockRequests.find(std::make_pair(m_peerId, id64)) != server->m_missingBlockRequests.end()) {
+			LOGINFO(6, "BLOCK_REQUEST for id = " << id << " was already sent to this peer");
 			return;
 		}
 
@@ -3114,7 +3175,10 @@ void P2PServer::P2PClient::on_block_notify(const uint8_t* buf)
 			});
 
 		if (result) {
-			m_blockPendingRequests.push_back(*id.u64());
+			server->m_blockNotifyRequests.insert(id64);
+			server->m_missingBlockRequests.emplace(m_peerId, id64);
+
+			m_blockPendingRequests.push_back(id64);
 		}
 	}
 }
@@ -3201,6 +3265,11 @@ bool P2PServer::P2PClient::on_aux_job_donation(const uint8_t* buf, uint32_t size
 	p += sizeof(int64_t);
 
 	// Ignore outdated messages
+	if (data_timestamp > std::numeric_limits<int64_t>::max() - AUX_JOB_TIMEOUT) {
+		LOGWARN(4, "peer " << static_cast<char*>(m_addrString) << " sent an invalid AUX_JOB_DONATION message (timestamp = " << data_timestamp << ')');
+		return false;
+	}
+
 	if (cur_time >= data_timestamp + AUX_JOB_TIMEOUT) {
 		LOGWARN(4, "peer " << static_cast<char*>(m_addrString) << " sent an outdated AUX_JOB_DONATION message ("  << cur_time << " >= " << data_timestamp << " + " << static_cast<int>(AUX_JOB_TIMEOUT) << ')');
 		return true;
@@ -3208,7 +3277,7 @@ bool P2PServer::P2PClient::on_aux_job_donation(const uint8_t* buf, uint32_t size
 
 	if ((data_end - p) % DATA_ENTRY_SIZE) {
 		LOGWARN(4, "peer " << static_cast<char*>(m_addrString) << " sent an invalid AUX_JOB_DONATION message (" << (data_end - p) << " is not a multiple of " << DATA_ENTRY_SIZE << ')');
-		return true;
+		return false;
 	}
 
 	hash digest;

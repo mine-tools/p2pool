@@ -162,13 +162,29 @@ struct alignas(uint64_t) hash
 {
 	uint8_t h[HASH_SIZE];
 
-	FORCEINLINE constexpr hash() : h{} {}
+	FORCEINLINE constexpr hash() noexcept : h{} {}
 
-	constexpr hash(std::initializer_list<uint8_t> l) : h{} {
+	constexpr hash(std::initializer_list<uint8_t> l) noexcept : h{} {
 		auto it = l.begin();
 
 		for (size_t i = 0; (i < HASH_SIZE) && (it != l.end()); ++i, ++it) {
 			h[i] = *it;
+		}
+	}
+
+	explicit constexpr hash(const char (&s)[HASH_SIZE * 2 + 1]) noexcept : h{} {
+		for (size_t i = 0; i < HASH_SIZE * 2; ++i) {
+			char c = s[i];
+
+			if ('0' <= c && c <= '9') {
+				c -= '0';
+			} else if ('a' <= c && c <= 'f') {
+				c = (c - 'a') + 10;
+			} else if ('A' <= c && c <= 'F') {
+				c = (c - 'A') + 10;
+			}
+
+			h[i / 2] = (h[i / 2] << 4) | static_cast<uint8_t>(c);
 		}
 	}
 
@@ -220,7 +236,7 @@ struct alignas(uint64_t) hash
 		uint64_t k = 0;
 
 		for (size_t i = 0; i < sizeof(uint64_t); ++i) {
-			k |= static_cast<uint64_t>(h[index * sizeof(uint64_t) + i]) << (i * sizeof(uint64_t));
+			k |= static_cast<uint64_t>(h[index * sizeof(uint64_t) + i]) << (i * 8);
 		}
 
 		return k;
@@ -401,18 +417,18 @@ struct indexed_hash
 		BUCKET_SHIFT = 32 - BUCKET_BITS,
 	};
 
-	static_assert((BUCKET_BITS > 0) && (BUCKET_BITS < 32), "Invalid bucket bit size");
+	static_assert((BUCKET_BITS > 0) && (BUCKET_BITS < 32) && (BUCKET_BITS + BUCKET_SHIFT == 32), "Invalid bucket bit size");
 
-	FORCEINLINE indexed_hash() : m_index(std::numeric_limits<uint32_t>::max()) {}
+	FORCEINLINE indexed_hash() noexcept : m_index(std::numeric_limits<uint32_t>::max()) {}
 
 	explicit indexed_hash(const hash& h);
 	~indexed_hash();
 
-	indexed_hash(const indexed_hash& h);
-	FORCEINLINE indexed_hash(indexed_hash&& h) : m_index(h.m_index) { h.m_index = std::numeric_limits<uint32_t>::max(); }
+	indexed_hash(const indexed_hash& h) noexcept;
+	FORCEINLINE indexed_hash(indexed_hash&& h) noexcept : m_index(h.m_index) { h.m_index = std::numeric_limits<uint32_t>::max(); }
 
-	indexed_hash& operator=(const indexed_hash& h);
-	indexed_hash& operator=(indexed_hash&& h);
+	indexed_hash& operator=(const indexed_hash& h) noexcept;
+	indexed_hash& operator=(indexed_hash&& h) noexcept;
 
 	FORCEINLINE indexed_hash& operator=(const hash& h)
 	{
