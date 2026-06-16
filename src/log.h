@@ -24,7 +24,7 @@ struct Params;
 
 namespace log {
 
-extern int GLOBAL_LOG_LEVEL;
+extern std::atomic<int> GLOBAL_LOG_LEVEL;
 extern bool CONSOLE_COLORS;
 constexpr int MAX_GLOBAL_LOG_LEVEL = 6;
 
@@ -235,7 +235,7 @@ template<> struct Stream::Entry<double>
 {
 	static NOINLINE void put(double x, Stream* wrapper)
 	{
-		char buf[16];
+		char buf[32];
 		int n = snprintf(buf, sizeof(buf), "%.3f", x);
 		if (n > 0) {
 			if (n > static_cast<int>(sizeof(buf)) - 1) {
@@ -539,6 +539,20 @@ struct log::Stream::Entry<PadRight<T>>
 template<> struct log::Stream::Entry<raw_ip> { static NOINLINE void put(const raw_ip& value, Stream* wrapper); };
 template<> struct log::Stream::Entry<Wallet> { static NOINLINE void put(const Wallet& w, Stream* wrapper); };
 
+template<typename T>
+struct log::Stream::Entry<std::optional<T>>
+{
+	static NOINLINE void put(const std::optional<T>& data, Stream* wrapper)
+	{
+		if (data.has_value()) {
+			*wrapper << data.value();
+		}
+		else {
+			*wrapper << "N/A";
+		}
+	}
+};
+
 namespace {
 	template<log::Severity severity>
 	FORCEINLINE void apply_severity(log::Stream& s)
@@ -609,7 +623,7 @@ struct DummyStream
 #define LOG(level, severity, ...) \
 	do { \
 		SIDE_EFFECT_CHECK(level, log_category_prefix << __VA_ARGS__); \
-		if ((level) <= log::GLOBAL_LOG_LEVEL) { \
+		if ((level) <= log::GLOBAL_LOG_LEVEL.load(std::memory_order_relaxed)) { \
 			log::Writer CONCAT(log_wrapper_, __LINE__)(severity); \
 			CONCAT(log_wrapper_, __LINE__) << log::Gray() << log_category_prefix; \
 			log::apply_severity<severity>(CONCAT(log_wrapper_, __LINE__)); \

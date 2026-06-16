@@ -20,6 +20,7 @@
 #include "uv_util.h"
 #include "pool_block.h"
 #include <map>
+#include <deque>
 #include <thread>
 
 namespace p2pool {
@@ -81,7 +82,7 @@ public:
 	[[nodiscard]] bool is_default() const;
 	[[nodiscard]] bool is_mini() const;
 	[[nodiscard]] bool is_nano() const;
-	[[nodiscard]] uint64_t bottom_height(const PoolBlock* tip) const;
+	[[nodiscard]] uint64_t get_bottom_height(const PoolBlock* tip) const;
 
 	[[nodiscard]] const PoolBlock* chainTip() const { return m_chainTip; }
 	[[nodiscard]] bool precalcFinished() const { return m_precalcFinished.load(); }
@@ -129,6 +130,9 @@ private:
 	std::map<uint64_t, std::vector<PoolBlock*>> m_blocksByHeight;
 	unordered_map<hash, PoolBlock*> m_blocksById;
 	unordered_map<root_hash, PoolBlock*> m_blocksByMerkleRoot;
+
+	// Pruned blocks which will soon be deleted
+	std::deque<std::pair<uint64_t, PoolBlock*>> m_blocksToDelete;
 
 	mutable ReadWriteLock m_seenDataLock;
 	unordered_map<hash, uint64_t> m_seenWallets;

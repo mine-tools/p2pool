@@ -122,7 +122,7 @@ Params::Params(const std::vector<std::vector<std::string>>& args)
 	char display_wallet_buf[Wallet::ADDRESS_LENGTH] = {};
 
 	if (m_mainWallet.valid() && m_subaddress.valid()) {
-		if (!m_miningWallet.assign(m_subaddress.spend_public_key(), m_mainWallet.view_public_key(), m_mainWallet.type(), false)) {
+		if (!m_miningWallet.assign(m_subaddress.spend_public_key(), m_mainWallet.view_public_key(), m_mainWallet.get_type(), false)) {
 			LOGERR(1, "Failed to configure the mining wallet, falling back to " << m_mainWallet);
 			m_miningWallet = m_mainWallet;
 			m_mainWallet.encode(display_wallet_buf);
@@ -290,7 +290,7 @@ bool Params::process_arg(const std::vector<std::string>& arg)
 
 	if ((arg[0] == "loglevel") && has1(arg)) {
 		const int level = std::min(std::max<int>(static_cast<int>(strtol(arg[1].c_str(), nullptr, 10)), 0), log::MAX_GLOBAL_LOG_LEVEL);
-		log::GLOBAL_LOG_LEVEL = level;
+		log::GLOBAL_LOG_LEVEL.store(level, std::memory_order_relaxed);
 		return true;
 	}
 
@@ -453,7 +453,7 @@ bool Params::process_arg(const std::vector<std::string>& arg)
 #endif
 
 	if ((arg[0] == "merge-mine") && has1(arg) && has2(arg)) {
-		m_mergeMiningHosts.emplace_back(arg[1], arg[2]);
+		m_mergeMiningHosts.emplace_back(arg[1], arg[2], has3(arg) ? arg[3] : std::string());
 		return true;
 	}
 
@@ -531,7 +531,7 @@ bool Params::valid() const
 			LOGERR(1, "Subaddress must start with 8... Try \"p2pool --help\".");
 			return false;
 		}
-		if (m_subaddress.type() != m_mainWallet.type()) {
+		if (m_subaddress.get_type() != m_mainWallet.get_type()) {
 			LOGERR(1, "Subaddress must belong to the same network type as the main wallet address. Try \"p2pool --help\".");
 			return false;
 		}

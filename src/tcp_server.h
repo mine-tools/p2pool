@@ -61,9 +61,12 @@ public:
 		Client(char* read_buf, size_t size);
 		virtual ~Client() {}
 
-		virtual size_t size() const = 0;
+		virtual size_t get_size() const = 0;
 
+		// "Client::reset();" MUST be called by all derived classes to avoid handle leaks
 		virtual void reset();
+
+		[[nodiscard]] virtual bool on_connect_pre() { return true; }
 		[[nodiscard]] virtual bool on_connect() = 0;
 		[[nodiscard]] virtual bool on_read(const char* data, uint32_t size) = 0;
 		[[nodiscard]] bool on_proxy_handshake(const char* data, uint32_t size);

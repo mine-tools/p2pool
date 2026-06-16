@@ -100,7 +100,9 @@ void p2pool_usage()
 		"--no-igd              An alias for --no-upnp\n"
 		"--upnp-stratum        Port forward Stratum port (it's not forwarded by default)\n"
 #endif
-		"--merge-mine          IP:port and wallet address for another blockchain to merge mine with\n"
+		"--merge-mine          [https://]IP:port and wallet address for another blockchain to merge mine with.\n"
+		"                      Prefix the host with https:// to connect over TLS (requires a TLS-enabled build).\n"
+		"                      An optional base64-encoded SPKI fingerprint can be added as a third value for certificate pinning\n"
 		"--version             Print p2pool's version and build details\n"
 #ifdef WITH_TLS
 		"--tls-cert file       Load TLS certificate chain from \"file\" in the PEM format\n"
@@ -346,7 +348,7 @@ int main(int argc, char* argv[])
 		p2pool::log::start(params);
 	}
 	else {
-		p2pool::log::GLOBAL_LOG_LEVEL = -1;
+		p2pool::log::GLOBAL_LOG_LEVEL.store(-1, std::memory_order_relaxed);
 	}
 
 	p2pool::init_crypto_cache();

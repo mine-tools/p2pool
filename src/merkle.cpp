@@ -19,7 +19,8 @@
 #include "keccak.h"
 #include "merkle.h"
 #include "keccak.h"
-#include "sha256.h"
+
+#include <openssl/sha2.h>
 
 namespace p2pool {
 
@@ -290,13 +291,17 @@ root_hash get_root_from_proof(hash h, const std::vector<hash>& proof, size_t ind
 	}
 
 	if (count == 1) {
+		if (proof.size() != 0) {
+			return root_hash();
+		}
+
 		return root_hash(h);
 	}
 
 	hash tmp[2];
 
 	if (count == 2) {
-		if (proof.empty()) {
+		if (proof.size() != 1) {
 			return root_hash();
 		}
 
@@ -358,6 +363,10 @@ root_hash get_root_from_proof(hash h, const std::vector<hash>& proof, size_t ind
 
 			keccak(tmp[0].h, HASH_SIZE * 2, h.h);
 		}
+
+		if (proof_index != proof.size()) {
+			return root_hash();
+		}
 	}
 
 	return root_hash(h);
@@ -365,7 +374,8 @@ root_hash get_root_from_proof(hash h, const std::vector<hash>& proof, size_t ind
 
 bool verify_merkle_proof(const hash& h, const std::vector<hash>& proof, size_t index, size_t count, const root_hash& root)
 {
-	return get_root_from_proof(h, proof, index, count) == root;
+	const root_hash r = get_root_from_proof(h, proof, index, count);
+	return !r.empty() && (r == root);
 }
 
 bool verify_merkle_proof(hash h, const std::vector<hash>& proof, uint32_t path, const root_hash& root)
@@ -403,9 +413,9 @@ uint32_t get_aux_slot(const hash &id, uint32_t nonce, uint32_t n_aux_chains)
 	buf[HASH_SIZE + sizeof(uint32_t)] = HASH_KEY_MM_SLOT;
 
 	hash res;
-	sha256(buf, sizeof(buf), res.h);
+	SHA256(buf, sizeof(buf), res.h);
 
-	return *reinterpret_cast<uint32_t*>(res.h) % n_aux_chains;
+	return read_unaligned(reinterpret_cast<uint32_t*>(res.h)) % n_aux_chains;
 }
 
 bool find_aux_nonce(const std::vector<hash>& aux_id, uint32_t& nonce, uint32_t max_nonce)

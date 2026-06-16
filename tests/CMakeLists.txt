@@ -22,6 +22,11 @@ endif()
 set(BUILD_GMOCK OFF CACHE BOOL "Builds the googlemock subproject" FORCE)
 set(INSTALL_GTEST OFF CACHE BOOL "Enable installation of googletest. (Projects embedding googletest may want to turn this OFF.)" FORCE)
 
+if (CMAKE_CXX_COMPILER_ID MATCHES MSVC)
+  set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} /fsanitize=address")
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /fsanitize=address")
+endif()
+
 add_subdirectory(googletest)
 set(LIBS gtest)
 
@@ -61,7 +66,6 @@ set(SOURCES
 	src/util_tests.cpp
 	src/wallet_tests.cpp
 	src/i2p_tests.cpp
-	../external/src/crypto/sha256.c
 	../external/src/cryptonote/crypto-ops-data.c
 	../external/src/cryptonote/crypto-ops.c
 	../external/src/cryptonote/fcmp_pp_crypto.cpp
@@ -87,6 +91,25 @@ set(SOURCES
 	../src/wallet.cpp
 	../src/i2p.cpp
 )
+
+set(BORINGSSL_DIR ../external/src/grpc/third_party/boringssl-with-bazel)
+include_directories(${BORINGSSL_DIR})
+include_directories(${BORINGSSL_DIR}/include)
+
+set(ED25519_SOURCES
+	${BORINGSSL_DIR}/crypto/curve25519/curve25519.cc
+	${BORINGSSL_DIR}/crypto/sha/sha256.cc
+	${BORINGSSL_DIR}/crypto/sha/sha512.cc
+	../external/src/crypto/bssl_stub.cpp
+)
+
+if (MSVC)
+	set_source_files_properties(${ED25519_SOURCES} PROPERTIES COMPILE_FLAGS "/w /DOPENSSL_NO_ASM /I\"${BORINGSSL_DIR}\" /I\"${BORINGSSL_DIR}/include\"")
+else()
+	set_source_files_properties(${ED25519_SOURCES} PROPERTIES COMPILE_FLAGS "-w -DOPENSSL_NO_ASM -I${BORINGSSL_DIR} -I${BORINGSSL_DIR}/include")
+endif()
+
+set(SOURCES ${SOURCES} ${ED25519_SOURCES})
 
 if (WITH_INDEXED_HASHES)
 	add_compile_definitions(WITH_INDEXED_HASHES)

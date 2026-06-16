@@ -268,9 +268,16 @@ static void do_status(p2pool *m_pool, const char * /* args */)
 
 	const MinerData data = m_pool->miner_data();
 
-	if (tip && (data.height < tip->m_txinGenHeight)) {
-		node_health -= 5;
-		comments.push_back("Your Monero node is lagging");
+	if (tip) {
+		if (data.height < tip->m_txinGenHeight) {
+			node_health -= 5;
+			comments.push_back("Your Monero node is lagging");
+		}
+
+		if (seconds_since_epoch() >= c.last_updated() + c.block_time() * 30) {
+			node_health -= 5;
+			comments.push_back("Sidechain seems to be stuck and/or out of sync");
+		}
 	}
 
 	if (stratum && (stratum->num_connections() == 0)) {
@@ -299,7 +306,7 @@ static void do_loglevel(p2pool * /* m_pool */, const char *args)
 {
 	int level = static_cast<int>(strtol(args, nullptr, 10));
 	level = std::min(std::max(level, 0), log::MAX_GLOBAL_LOG_LEVEL);
-	log::GLOBAL_LOG_LEVEL = level;
+	log::GLOBAL_LOG_LEVEL.store(level, std::memory_order_relaxed);
 	LOGINFO(0, "log level set to " << level);
 }
 

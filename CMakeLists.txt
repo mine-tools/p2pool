@@ -18,7 +18,7 @@ option(WITH_LTO "Use link-time compiler optimization (if linking fails for you, 
 option(WITH_UPNP "Include UPnP support. If this is turned off, p2pool will not be able to configure port forwarding on UPnP-enabled routers." ON)
 option(WITH_GRPC "Include gRPC support. If this is turned off, p2pool will not be able to merge mine with Tari." ON)
 option(WITH_TLS "Include TLS support. If this is turned off, p2pool will not support Stratum TLS connections, and lack many other security features. It's recommended to keep it ON!" ON)
-option(WITH_INDEXED_HASHES "Save memory used for storing transaction hashes and public keys (a bit slower block verification - use it only if you compile for a very low memory system)" OFF)
+option(WITH_INDEXED_HASHES "Save memory used for storing transaction hashes and public keys (a bit slower block verification and can potentially crash on overflow - use it at your own risk on a very low memory system)" OFF)
 
 option(WITH_MERGE_MINING_DONATION "Merge mine donations to the author. This doesn't affect your hashrate or payouts in any way - only unused merge mining capacity will be utilised. If you merge mine yourself, your settings will take priority." ON)
 
@@ -101,7 +101,6 @@ endif()
 include(cmake/flags.cmake)
 
 set(HEADERS
-	external/src/crypto/sha256.h
 	external/src/cryptonote/crypto-ops.h
 	external/src/hardforks/hardforks.h
 	src/block_cache.h
@@ -136,7 +135,6 @@ set(HEADERS
 )
 
 set(SOURCES
-	external/src/crypto/sha256.c
 	external/src/cryptonote/crypto-ops-data.c
 	external/src/cryptonote/crypto-ops.c
 	external/src/cryptonote/fcmp_pp_crypto.cpp
@@ -168,6 +166,26 @@ set(SOURCES
 	src/zmq_reader.cpp
 	src/i2p.cpp
 )
+
+if (NOT WITH_TLS AND NOT WITH_GRPC)
+	set(BORINGSSL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/src/grpc/third_party/boringssl-with-bazel)
+	include_directories(${BORINGSSL_DIR}/include)
+
+	set(ED25519_SOURCES
+		${BORINGSSL_DIR}/crypto/curve25519/curve25519.cc
+		${BORINGSSL_DIR}/crypto/sha/sha256.cc
+		${BORINGSSL_DIR}/crypto/sha/sha512.cc
+		external/src/crypto/bssl_stub.cpp
+	)
+
+	if (MSVC)
+		set_source_files_properties(${ED25519_SOURCES} PROPERTIES COMPILE_FLAGS "/W0 /DOPENSSL_NO_ASM /I\"${BORINGSSL_DIR}\" /I\"${BORINGSSL_DIR}/include\"")
+	else()
+		set_source_files_properties(${ED25519_SOURCES} PROPERTIES COMPILE_FLAGS "-w -DOPENSSL_NO_ASM -I${BORINGSSL_DIR} -I${BORINGSSL_DIR}/include")
+	endif()
+
+	set(SOURCES ${SOURCES} ${ED25519_SOURCES})
+endif()
 
 if (AMD64)
 	set(SOURCES ${SOURCES} src/keccak_bmi.cpp)
@@ -412,6 +430,8 @@ include(cmake/git.cmake)
 add_executable(${CMAKE_PROJECT_NAME} ${HEADERS} ${SOURCES})
 
 if (STATIC_BINARY OR STATIC_LIBS)
+	add_definitions("-DP2POOL_STATIC_LIBS")
+
 	if ((CMAKE_BUILD_TYPE STREQUAL "Release") AND (NOT (DEV_WITH_TSAN OR DEV_WITH_MSAN OR DEV_WITH_UBSAN OR DEV_WITH_ASAN)))
 		if (WIN32)
 			add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD COMMAND ${CMAKE_STRIP} "${CMAKE_PROJECT_NAME}.exe")

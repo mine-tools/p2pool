@@ -63,6 +63,24 @@ JSON_VALUE_PARSER(Bool, bool)
 
 #undef JSON_VALUE_PARSER
 
+template<typename T, typename U>
+struct parse_wrapper<T, std::optional<U>>
+{
+	static NOINLINE bool parse(T& v, const char* name, std::optional<U>& out_value)
+	{
+		U tmp{};
+
+		if (parseValue(v, name, tmp)) {
+			out_value = std::move(tmp);
+			return true;
+		}
+
+		// Optional value is always parsed successfully, it will just be "N/A" if the actual parsing failed
+		out_value.reset();
+		return true;
+	}
+};
+
 template<typename T>
 struct parse_wrapper<T, hash>
 {
@@ -116,6 +134,11 @@ struct parse_wrapper<T, difficulty_type>
 		if ((N >= 2) && (s[0] == '0') && (s[1] == 'x')) {
 			s += 2;
 			N -= 2;
+		}
+
+		// Max 32 hex characters (128 bit)
+		if (N > 32) {
+			return false;
 		}
 
 		out_value.lo = 0;

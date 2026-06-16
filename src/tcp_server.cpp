@@ -96,6 +96,8 @@ TCPServer::~TCPServer()
 		shutdown_tcp();
 	}
 
+	uv_mutex_destroy(&m_bansLock);
+
 	delete m_connectedClientsList;
 }
 
@@ -128,7 +130,7 @@ void TCPServer::parse_address_list_internal(const std::string& address_list, con
 				}
 			}
 
-			const uint32_t port = strtoul(address.c_str() + k2 + 1, nullptr, 10);
+			const unsigned long port = strtoul(address.c_str() + k2 + 1, nullptr, 10);
 			if ((port > 0) && (port < 65536)) {
 				callback(is_v6, address, ip, static_cast<int>(port));
 			}
@@ -498,6 +500,8 @@ void TCPServer::close_sockets(bool listen_sockets)
 	size_t numClosed = 0;
 
 	for (Client* c = m_connectedClientsList->m_next; c != m_connectedClientsList; c = c->m_next) {
+		c->m_isClosing = true;
+
 		uv_handle_t* h = reinterpret_cast<uv_handle_t*>(&c->m_socket);
 		if (!uv_is_closing(h)) {
 			uv_close(h, on_connection_close);
@@ -533,8 +537,6 @@ void TCPServer::shutdown_tcp()
 		uv_thread_join(&m_loopThread);
 	}
 
-	uv_mutex_destroy(&m_bansLock);
-
 	LOGINFO(1, "stopped");
 }
 
@@ -569,10 +571,14 @@ void TCPServer::print_bans()
 
 	MutexLock lock(m_bansLock);
 
-	for (const auto& b : m_bans) {
-		if (cur_time < b.second) {
-			const uint64_t t = duration_cast<seconds>(b.second - cur_time).count();
-			LOGINFO(0, b.first << " is banned (" << t << " seconds left)");
+	for (auto it = m_bans.begin(); it != m_bans.end();) {
+		if (cur_time < it->second) {
+			const uint64_t t = duration_cast<seconds>(it->second - cur_time).count();
+			LOGINFO(0, it->first << " is banned (" << t << " seconds left)");
+			++it;
+		}
+		else {
+			it = m_bans.erase(it);
 		}
 	}
 }
@@ -730,7 +736,7 @@ void TCPServer::loop(void* data)
 
 	for (Client* c : server->m_preallocatedClients) {
 		ASAN_UNPOISON_MEMORY_REGION(c, sizeof(Client));
-		ASAN_UNPOISON_MEMORY_REGION(c, c->size());
+		ASAN_UNPOISON_MEMORY_REGION(c, c->get_size());
 		delete c;
 	}
 	server->m_preallocatedClients.clear();
@@ -789,7 +795,14 @@ void TCPServer::on_connection_close(uv_handle_t* handle)
 void TCPServer::on_connection_error(uv_handle_t* handle)
 {
 	Client* client = reinterpret_cast<Client*>(handle->data);
-	client->m_owner->return_client(client);
+	TCPServer* owner = client->m_owner;
+
+	if (owner) {
+		owner->return_client(client);
+	}
+	else {
+		LOGERR(5, "internal error: can't find TCPServer instance for peer " << log::Gray() << static_cast<char*>(client->m_addrString) << ", this will leak memory");
+	}
 }
 
 void TCPServer::on_connect(uv_connect_t* req, int status)
@@ -901,6 +914,12 @@ void TCPServer::on_new_client(uv_stream_t* server, Client* client)
 	}
 
 	LOGINFO(5, "new connection " << (client->m_isIncoming ? "from " : "to ") << log::Gray() << static_cast<char*>(client->m_addrString));
+
+	// Preliminary on_connect callback to let the derived classes handle PROXY protocol initial connection cases
+	if (!client->on_connect_pre()) {
+		client->close();
+		return;
+	}
 
 	if (m_proxyProtocol && client->m_isIncoming) {
 		// Defer ban check and on_connect until real IP is extracted from PROXY protocol header
@@ -1072,7 +1091,7 @@ TCPServer::Client* TCPServer::get_client()
 		c = m_preallocatedClients.back();
 		m_preallocatedClients.pop_back();
 		ASAN_UNPOISON_MEMORY_REGION(c, sizeof(Client));
-		ASAN_UNPOISON_MEMORY_REGION(c, c->size());
+		ASAN_UNPOISON_MEMORY_REGION(c, c->get_size());
 		c->reset();
 	}
 	else {
@@ -1558,7 +1577,7 @@ void TCPServer::Client::asan_poison_this() const
 	const uint8_t* begin = reinterpret_cast<const uint8_t*>(this);
 	const uint8_t* counter_begin = reinterpret_cast<const uint8_t*>(&m_resetCounter);
 	const uint8_t* counter_end = counter_begin + sizeof(m_resetCounter);
-	const uint8_t* end = begin + size();
+	const uint8_t* end = begin + get_size();
 
 	ASAN_POISON_MEMORY_REGION(begin, counter_begin - begin);
 	ASAN_POISON_MEMORY_REGION(counter_end, end - counter_end);

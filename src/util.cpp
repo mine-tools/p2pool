@@ -107,7 +107,8 @@ std::string p2pool_version()
 		<< " - grpc " << GRPC_CPP_VERSION_STRING << '\n'
 #endif
 #ifndef P2POOL_UNIT_TESTS
-		<< " - libcurl " << (curl_version_data ? curl_version_data->version : "unknown") << '\n'
+		<< " - libcurl " << (curl_version_data ? curl_version_data->version : "unknown")
+		<< ", SSL library: " << (curl_version_data ? curl_version_data->ssl_version : "unknown") << '\n'
 #endif
 		<< " - libuv " << uv_version_string() << '\n'
 		<< " - libzmq " << zmq_major << '.' << zmq_minor << '.' << zmq_patch << '\n'
@@ -791,9 +792,9 @@ void DeleteLoopUserData(uv_loop_t* loop)
 #ifdef WITH_UPNP
 static struct UPnP_Discover
 {
-	uv_mutex_t lock;
-	int error;
-	UPNPDev* devlist;
+	uv_mutex_t lock = {};
+	int error = 0;
+	UPNPDev* devlist = nullptr;
 } upnp_discover;
 
 void init_upnp()
@@ -959,7 +960,7 @@ void init_uv()
 #define putenv _putenv
 #endif
 
-	const uint32_t N = std::min(std::max(std::thread::hardware_concurrency(), 4U), 8U);
+	const uint32_t N = std::min(std::max(std::thread::hardware_concurrency(), MIN_UV_THREADPOOL_SIZE), MAX_UV_THREADPOOL_SIZE);
 
 	static char buf[40] = {};
 	log::Stream s(buf);
@@ -1035,10 +1036,16 @@ hash from_onion_v3(const std::string& address)
 		return {};
 	}
 
-	const hash result = from_onion_v3_const(address.c_str());
+	uint8_t version = 0;
+	const hash result = from_onion_v3_const(address.c_str(), &version);
 
 	if (result.empty()) {
 		LOGWARN(3, "Invalid onion address \"" << address << "\": has invalid character(s)");
+		return {};
+	}
+
+	if (version != 3) {
+		LOGWARN(3, "Invalid onion address \"" << address << "\": invalid version " << version);
 		return {};
 	}
 

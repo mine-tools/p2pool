@@ -30,6 +30,7 @@ LOG_CATEGORY(StratumServer)
 
 static constexpr int DEFAULT_BACKLOG = 128;
 static constexpr uint64_t MIN_DIFF = 1000;
+static constexpr uint64_t MAX_TARGET = (std::numeric_limits<uint64_t>::max() / MIN_DIFF) + 1;
 static constexpr uint64_t AUTO_DIFF_TARGET_TIME = 30;
 
 // Use short target format (4 bytes) for diff <= 4 million
@@ -226,7 +227,7 @@ void StratumServer::format_wallet(const Wallet& w, char (&buf)[Wallet::ADDRESS_L
 
 void StratumServer::on_block(const BlockTemplate& block)
 {
-	LOGINFO(4, "new block template at height " << block.height());
+	LOGINFO(4, "new block template at height " << block.get_height());
 
 	const uint32_t num_connections = m_numConnections;
 	if (num_connections == 0) {
@@ -269,8 +270,8 @@ void StratumServer::on_block(const BlockTemplate& block)
 	blobs_data->m_blobSize = block.get_hashing_blobs(extra_nonce_start, num_connections, blobs_data->m_blobs, blobs_data->m_height, difficulty, aux_diff, sidechain_difficulty, blobs_data->m_seedHash, nonce_offset, blobs_data->m_templateId);
 
 	// Integrity checks
-	if (blobs_data->m_blobSize < 76) {
-		LOGERR(1, "internal error: get_hashing_blobs returned too small blobs (" << blobs_data->m_blobSize << " bytes)");
+	if ((blobs_data->m_blobSize < HASHING_BLOB_MIN_SIZE) || (blobs_data->m_blobSize > HASHING_BLOB_MAX_SIZE)) {
+		LOGERR(1, "internal error: get_hashing_blobs returned wrong sized blobs (" << blobs_data->m_blobSize << " bytes)");
 		delete blobs_data;
 		return;
 	}
@@ -307,6 +308,8 @@ void StratumServer::on_block(const BlockTemplate& block)
 
 	blobs_data->m_target = std::max(difficulty.target(), sidechain_difficulty.target());
 	blobs_data->m_target = std::max(blobs_data->m_target, aux_diff.target());
+
+	blobs_data->m_target = std::min(blobs_data->m_target, MAX_TARGET);
 
 	{
 		MutexLock lock(m_blobsQueueLock);
@@ -454,7 +457,7 @@ bool StratumServer::on_login(StratumClient* client, uint32_t id, const char* log
 
 	const uint32_t extra_nonce = m_extraNonce.fetch_add(1);
 
-	uint8_t hashing_blob[128];
+	uint8_t hashing_blob[HASHING_BLOB_MAX_SIZE];
 	uint64_t height, sidechain_height;
 	difficulty_type difficulty;
 	difficulty_type aux_diff;
@@ -476,6 +479,8 @@ bool StratumServer::on_login(StratumClient* client, uint32_t id, const char* log
 		// Limit autodiff to 4000000 for maximum compatibility
 		target = std::max(target, std::max(AUTODIFF_START, TARGET_4_BYTES_LIMIT));
 	}
+
+	target = std::min(target, MAX_TARGET);
 
 	if (get_custom_user(login, client->m_customUser)) {
 		const char* s = client->m_customUser;
@@ -878,7 +883,7 @@ void StratumServer::print_stratum_status() const
 		ReadLock lock(m_hashrateDataLock);
 
 		total_hashes = m_cumulativeHashes;
-		hashes_since_last_share = m_cumulativeHashes - m_cumulativeHashesAtLastShare;
+		hashes_since_last_share = (m_cumulativeHashes > m_cumulativeHashesAtLastShare) ? (m_cumulativeHashes - m_cumulativeHashesAtLastShare) : 0;
 
 		const HashrateData* data = m_hashrateData;
 		const HashrateData& head = data[m_hashrateDataHead];
@@ -1085,13 +1090,13 @@ void StratumServer::on_blobs_ready()
 				target = std::max(target, AUTODIFF_START);
 
 				const uint64_t num_halvings = (cur_time - client->m_connectedTime) / 16;
-				constexpr uint64_t max_target = (std::numeric_limits<uint64_t>::max() / MIN_DIFF) + 1;
-				for (uint64_t i = 0; (i < num_halvings) && (target < max_target); ++i) {
+				for (uint64_t i = 0; (i < num_halvings) && (target < MAX_TARGET); ++i) {
 					target *= 2;
 				}
-				target = std::min<uint64_t>(target, max_target);
 			}
 		}
+
+		target = std::min(target, MAX_TARGET);
 
 		uint32_t job_id;
 		{
@@ -1220,7 +1225,7 @@ void StratumServer::on_share_found(uv_work_t* req)
 			LOGWARN(0, "p2pool is shutting down, but a share was found. Trying to process it anyway!");
 		}
 
-		uint8_t blob[128];
+		uint8_t blob[HASHING_BLOB_MAX_SIZE];
 		uint64_t height;
 		difficulty_type difficulty;
 		difficulty_type aux_diff;
@@ -1248,17 +1253,25 @@ void StratumServer::on_share_found(uv_work_t* req)
 		}
 
 		if (pow_hash != share->m_resultHash) {
-			LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " submitted a share with invalid PoW");
-			share->m_result = SubmittedShare::Result::INVALID_POW;
-			share->m_score = BAD_SHARE_POINTS;
+			bool invalid_pow = true;
 
 			// Calculate the same hash second time to check if it's an unstable hardware that caused this
 			hash pow_hash2;
 			if (pool->calculate_hash(blob, blob_size, height, seed_hash, pow_hash2, true) && (pow_hash2 != pow_hash)) {
 				LOGERR(0, "UNSTABLE HARDWARE DETECTED: Calculated the same hash twice, got different results: " << pow_hash << " != " << pow_hash2);
+
+				if (pow_hash2 == share->m_resultHash) {
+					invalid_pow = false;
+				}
 			}
 
-			return;
+			if (invalid_pow) {
+				LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " submitted a share with invalid PoW");
+				share->m_result = SubmittedShare::Result::INVALID_POW;
+				share->m_score = BAD_SHARE_POINTS;
+
+				return;
+			}
 		}
 
 		share->m_score = GOOD_SHARE_POINTS;
@@ -1328,6 +1341,7 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 		}
 		else {
 			static const char* reason_list[] = {
+				"none",
 				"stale share",
 				"couldn't check PoW",
 				"low difficulty",
@@ -1366,6 +1380,9 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 			{
 				log::Stream s(buf, buf_size);
 				switch (share->m_result) {
+				case SubmittedShare::Result::NONE:
+					s << "{\"id\":" << share->m_id << ",\"jsonrpc\":\"2.0\",\"error\":{\"message\":\"none\"}}\n";
+					break;
 				case SubmittedShare::Result::STALE:
 					s << "{\"id\":" << share->m_id << ",\"jsonrpc\":\"2.0\",\"error\":{\"message\":\"Stale share\"}}\n";
 					break;
@@ -1862,7 +1879,7 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 		ReadLock lock(m_hashrateDataLock);
 
 		total_hashes = m_cumulativeHashes;
-		hashes_since_last_share = m_cumulativeHashes - m_cumulativeHashesAtLastShare;
+		hashes_since_last_share = (m_cumulativeHashes > m_cumulativeHashesAtLastShare) ? (m_cumulativeHashes - m_cumulativeHashesAtLastShare) : 0;
 
 		const HashrateData* data = m_hashrateData;
 		const HashrateData& head = data[m_hashrateDataHead];

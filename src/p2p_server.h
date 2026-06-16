@@ -85,9 +85,10 @@ public:
 		~P2PClient() override;
 
 		static Client* allocate() { return new P2PClient(); }
-		virtual size_t size() const override { return sizeof(P2PClient); }
+		virtual size_t get_size() const override { return sizeof(P2PClient); }
 
 		void reset() override;
+		[[nodiscard]] bool on_connect_pre() override;
 		[[nodiscard]] bool on_connect() override;
 		[[nodiscard]] bool on_read(const char* data, uint32_t size) override;
 		void on_read_failed(int err) override;
@@ -136,6 +137,8 @@ public:
 
 		uint64_t m_peerId;
 		uint64_t m_connectedTime;
+		bool m_connectedDomain;
+
 		uint64_t m_broadcastMaxHeight;
 
 		MessageId m_expectedMessage;
@@ -162,10 +165,15 @@ public:
 		uint64_t m_lastBroadcastTimestamp;
 		uint64_t m_lastBlockrequestTimestamp;
 
+		// Anti-spam broadcast throttle
+		uint64_t m_broadcastThrottleTimestamp;
+		uint64_t m_broadcastThrottleCounter;
+
 		hash m_broadcastedHashes[8];
 		uint32_t m_broadcastedHashesIndex;
 
 		hash m_lastMoneroBlockBroadcastDigest;
+		uint64_t m_lastAuxJobMessage;
 
 		// log::Stream wrapper
 		struct SoftwareDisplayName
@@ -181,13 +189,23 @@ public:
 	{
 		Broadcast(const PoolBlock& block, const PoolBlock* parent);
 
+		enum Type {
+			FULL,
+			PRUNED,
+			COMPACT,
+			COMPACT_UNPRUNED,
+		};
+
 		hash id;
 		uint64_t received_timestamp;
 
 		std::vector<uint8_t> blob;
 		std::vector<uint8_t> pruned_blob;
 		std::vector<uint8_t> compact_blob;
-		std::vector<hash> ancestor_hashes;
+		std::vector<uint8_t> compact_unpruned_blob;
+
+		hash parent_hash;
+		std::vector<hash> uncle_hashes;
 	};
 
 	void broadcast(const PoolBlock& block, const PoolBlock* parent);
@@ -264,7 +282,7 @@ private:
 	uv_mutex_t m_blockLock;
 	PoolBlock* m_block;
 	std::vector<uint8_t> m_blockDeserializeBuf;
-	int m_blockDeserializeResult;
+	bool m_blockDeserializeBufCompact;
 
 	uv_timer_t m_timer;
 	uint64_t m_timerCounter;
@@ -275,16 +293,17 @@ private:
 	uint64_t m_peerId_I2P;
 
 	mutable uv_mutex_t m_peerListLock;
+	uv_mutex_t m_peerListSaveLock;
 
 	struct Peer
 	{
 		void normalize();
 
-		bool m_isV6;
+		bool m_isV6 = false;
 		raw_ip m_addr;
-		int m_port;
-		uint32_t m_numFailedConnections;
-		uint64_t m_lastSeen;
+		int m_port = 0;
+		uint32_t m_numFailedConnections = 0;
+		uint64_t m_lastSeen = 0;
 	};
 
 	std::atomic<bool> m_seenGoodPeers;

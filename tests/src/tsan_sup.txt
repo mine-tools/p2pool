@@ -1,3 +1,0 @@
-race:p2pool::log::Worker::run()
-race:p2pool::log::Worker::write
-race_top:do_loglevel

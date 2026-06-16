@@ -18,6 +18,7 @@
 #pragma once
 
 #include "uv_util.h"
+#include "pool_block.h"
 #include <chrono>
 
 namespace p2pool {
@@ -43,21 +44,21 @@ private:
 
 	struct WorkerData
 	{
-		Miner* m_miner;
-		uint32_t m_index;
-		uint32_t m_count;
-		uv_thread_t m_worker;
+		Miner* m_miner = nullptr;
+		uint32_t m_index = 0;
+		uint32_t m_count = 0;
+		uv_thread_t m_worker = {};
 	};
 
 	std::vector<WorkerData*> m_minerThreads;
 	std::atomic<bool> m_stopped;
 
-	std::chrono::high_resolution_clock::time_point m_startTimestamp;
+	std::chrono::steady_clock::time_point m_startTimestamp;
 
 	std::mt19937_64 m_rng;
 
 	std::atomic<uint64_t> m_fullNonce;
-	std::chrono::high_resolution_clock::time_point m_nonceTimestamp;
+	std::chrono::steady_clock::time_point m_nonceTimestamp;
 
 	std::atomic<uint64_t> m_totalHashes;
 	std::atomic<uint32_t> m_sharesFound;
@@ -65,7 +66,7 @@ private:
 
 	struct Job
 	{
-		uint8_t m_blob[128] = {};
+		uint8_t m_blob[HASHING_BLOB_MAX_SIZE] = {};
 		uint32_t m_blobSize = 0;
 		uint32_t m_templateId = 0;
 		difficulty_type m_diff = {};

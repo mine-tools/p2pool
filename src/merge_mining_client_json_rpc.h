@@ -27,11 +27,13 @@ struct PoolBlock;
 class MergeMiningClientJSON_RPC : public MergeMiningClientShared
 {
 public:
-	MergeMiningClientJSON_RPC(p2pool* pool, const std::string& host, const std::string& wallet);
+	MergeMiningClientJSON_RPC(p2pool* pool, const std::string& host, const std::string& wallet, const std::string& spkiFingerprint);
 	~MergeMiningClientJSON_RPC() override;
 
+	static constexpr char HTTPS_PREFIX[] = "https://";
+
 	bool get_params(ChainParameters& out_params) const override;
-	void submit_solution(const std::vector<uint8_t>& coinbase_merkle_proof, const uint8_t (&hashing_blob)[128], size_t nonce_offset, const hash& seed_hash, const std::vector<uint8_t>& blob, const std::vector<hash>& merkle_proof, uint32_t merkle_proof_path) override;
+	void submit_solution(const std::vector<uint8_t>& coinbase_merkle_proof, const uint8_t (&hashing_blob)[HASHING_BLOB_MAX_SIZE], size_t nonce_offset, const hash& seed_hash, const std::vector<uint8_t>& blob, const std::vector<hash>& merkle_proof, uint32_t merkle_proof_path) override;
 
 	void print_status() const override;
 	void api_status(log::Stream&) const override;
@@ -52,9 +54,18 @@ private:
 
 	bool parse_merge_mining_submit_solution(const char* data, size_t size) const;
 
+	std::optional<std::string> m_auxTicker;
+	std::optional<uint64_t> m_auxDenomination;
+
+	std::optional<uint64_t> m_auxHeight;
+	std::optional<uint64_t> m_auxReward;
+	std::optional<uint64_t> m_auxFees;
+
 	std::vector<uint8_t> m_previousAuxBlobs[NUM_PREVIOUS_HASHES];
 
 	std::string m_host;
+	bool m_tls;
+	std::string m_spkiFingerprint;
 	int32_t m_port;
 
 	uv_loop_t m_loop;

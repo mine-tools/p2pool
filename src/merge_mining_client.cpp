@@ -36,7 +36,7 @@ namespace p2pool {
 
 static constexpr hash Tari_ChainID{ "01f0cf665bd4cd31cbb2b2470236389c483522b350335e10a4a5dca34cb85990" };
 
-IMergeMiningClient* IMergeMiningClient::create(p2pool* pool, const std::string& host, const std::string& wallet) noexcept
+IMergeMiningClient* IMergeMiningClient::create(p2pool* pool, const std::string& host, const std::string& wallet, const std::string& spkiFingerprint) noexcept
 {
 	try {
 #if defined(WITH_GRPC) && !defined(P2POOL_UNIT_TESTS)
@@ -44,7 +44,7 @@ IMergeMiningClient* IMergeMiningClient::create(p2pool* pool, const std::string& 
 			return new MergeMiningClientTari(pool, host, wallet);
 		}
 #endif
-		return new MergeMiningClientJSON_RPC(pool, host, wallet);
+		return new MergeMiningClientJSON_RPC(pool, host, wallet, spkiFingerprint);
 	}
 	catch (...) {
 		LOGERR(1, "Failed to create merge mining client for " << host);
@@ -83,7 +83,7 @@ void MergeMiningClientShared::on_external_block(const PoolBlock& block)
 	ON_SCOPE_LEAVE([old_log_category_prefix]() { log_category_prefix = old_log_category_prefix; });
 
 	// Sanity check
-	if (block.m_transactions.empty() || block.m_hashingBlob.empty() || (block.m_hashingBlob.size() > 128)) {
+	if (block.m_transactions.empty() || (block.m_hashingBlob.size() < HASHING_BLOB_MIN_SIZE) || (block.m_hashingBlob.size() > HASHING_BLOB_MAX_SIZE)) {
 		LOGWARN(3, "on_external_block: sanity check failed - " << block.m_transactions.size() << " transactions, hashing blob size = " << block.m_hashingBlob.size());
 		return;
 	}
@@ -233,7 +233,7 @@ void MergeMiningClientShared::on_external_block(const PoolBlock& block)
 
 	// hashing_blob
 
-	uint8_t hashing_blob[128] = {};
+	uint8_t hashing_blob[HASHING_BLOB_MAX_SIZE] = {};
 	memcpy(hashing_blob, block.m_hashingBlob.data(), block.m_hashingBlob.size());
 
 	// nonce_offset and blob
