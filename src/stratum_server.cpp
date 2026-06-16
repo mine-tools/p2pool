@@ -439,7 +439,7 @@ bool StratumServer::on_login(StratumClient* client, uint32_t id, const char* log
 
 		Wallet w(nullptr);
 		const Wallet& fallback = m_pool->params().m_miningWallet;
-		if (w.decode(addr_buf) && w.valid() && (w.type() == fallback.type())) {
+		if (w.decode(addr_buf) && w.valid() && (w.get_type() == fallback.get_type())) {
 			client->m_minerWallet = w;
 		}
 		else {
