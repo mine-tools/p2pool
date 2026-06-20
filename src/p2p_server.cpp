@@ -905,6 +905,13 @@ void P2PServer::load_monerod_peer_list()
 		return;
 	}
 
+	// With --no-dns, don't bootstrap from the Monero node's peer list either.
+	// Those are Monero nodes, not p2pool nodes; on a private sidechain they only
+	// cause failed handshakes and bans. Peers must be provided via --addpeers.
+	if (!m_pool->params().m_dns) {
+		return;
+	}
+
 	const Params::Host& host = m_pool->current_host();
 
 	JSONRPCRequest::call(host.m_address, host.m_rpcPort, "/get_peer_list", host.m_rpcLogin, m_socks5Proxy, host.m_rpcSSL, host.m_rpcSSL_Fingerprint,
