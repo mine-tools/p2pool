@@ -384,11 +384,8 @@ bool TCPServer::connect_to_peer(Client* client)
 		return false;
 	}
 
-	if ((client->m_addressType != Client::AddressType::DomainName) && (m_pendingConnections.find(client->m_addr) != m_pendingConnections.end())) {
-		LOGINFO(6, "there is already a pending connection to this IP, not connecting to " << log::Gray() << static_cast<char*>(client->m_addrString));
-		return_client(client);
-		return false;
-	}
+	// NOTE: the upstream "one pending connection per IP" restriction is intentionally
+	// removed, so multiple trusted nodes behind a single IP / NAT can all be dialed.
 
 	int err = uv_tcp_init(&m_loop, &client->m_socket);
 	if (err) {
