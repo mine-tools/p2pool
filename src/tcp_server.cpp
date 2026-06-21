@@ -546,6 +546,10 @@ void TCPServer::print_status()
 
 void TCPServer::ban(bool is_v6, raw_ip ip, uint64_t seconds)
 {
+	if (m_banningDisabled) {
+		return;
+	}
+
 	if (ip.is_localhost()) {
 		return;
 	}
@@ -1535,6 +1539,10 @@ void TCPServer::Client::ban(uint64_t seconds)
 	}
 
 	if (m_owner) {
+		if (m_owner->m_banningDisabled) {
+			return;
+		}
+
 		LOGWARN(3, "peer " << static_cast<char*>(m_addrString) << " banned for " << seconds << " seconds");
 		m_owner->ban(isV6(), m_addr, seconds);
 	}

@@ -111,6 +111,8 @@ P2PServer::P2PServer(p2pool* pool)
 	set_max_outgoing_peers(params.m_maxOutgoingPeers);
 	set_max_incoming_peers(params.m_maxIncomingPeers);
 
+	m_banningDisabled = params.m_noBan;
+
 	uv_mutex_init_checked(&m_blockLock);
 	uv_mutex_init_checked(&m_peerListLock);
 	uv_mutex_init_checked(&m_peerListSaveLock);
@@ -3686,9 +3688,11 @@ bool P2PServer::P2PClient::on_monero_block_broadcast(const uint8_t* buf, uint32_
 
 				if (client->m_resetCounter == work->reset_counter) {
 					client->close();
-					LOGWARN(3, "peer " << static_cast<const char*>(client->m_addrString) << " banned for " << DEFAULT_BAN_TIME << " seconds");
+					if (!server->banning_disabled()) {
+						LOGWARN(3, "peer " << static_cast<const char*>(client->m_addrString) << " banned for " << DEFAULT_BAN_TIME << " seconds");
+					}
 				}
-				else {
+				else if (!server->banning_disabled()) {
 					LOGWARN(3, work->addr << " banned for " << DEFAULT_BAN_TIME << " seconds");
 				}
 
@@ -3825,15 +3829,18 @@ void P2PServer::P2PClient::post_handle_incoming_block(p2pool* pool, const PoolBl
 
 	if (!result) {
 		// Client sent bad data, disconnect and ban it
+		P2PServer* server = pool->p2p_server();
+
 		if (reset_counter == new_reset_counter) {
 			close();
-			LOGWARN(3, "peer " << static_cast<char*>(m_addrString) << " banned for " << DEFAULT_BAN_TIME << " seconds");
+			if (!server->banning_disabled()) {
+				LOGWARN(3, "peer " << static_cast<char*>(m_addrString) << " banned for " << DEFAULT_BAN_TIME << " seconds");
+			}
 		}
-		else {
+		else if (!server->banning_disabled()) {
 			LOGWARN(3, addr << " banned for " << DEFAULT_BAN_TIME << " seconds");
 		}
 
-		P2PServer* server = pool->p2p_server();
 		server->ban(is_v6, addr, DEFAULT_BAN_TIME);
 		server->remove_peer_from_list(addr);
 

@@ -94,6 +94,7 @@ StratumServer::StratumServer(p2pool* pool)
 
 	const Params& params = pool->params();
 	m_banTime = params.m_stratumBanTime;
+	m_banningDisabled = params.m_noBan;
 	start_listening(params.m_stratumAddresses, params.m_upnp && params.m_upnpStratum);
 }
 

@@ -440,6 +440,11 @@ bool Params::process_arg(const std::vector<std::string>& arg)
 		return true;
 	}
 
+	if (arg[0] == "no-ban") {
+		m_noBan = true;
+		return true;
+	}
+
 #ifdef WITH_UPNP
 	if ((arg[0] == "no-upnp") || (arg[0] == "no-igd")) {
 		m_upnp = false;

@@ -232,6 +232,12 @@ protected:
 	uv_mutex_t m_bansLock;
 	unordered_map<raw_ip, std::chrono::steady_clock::time_point> m_bans;
 
+	// When true, IP banning is disabled entirely (set by P2PServer/StratumServer
+	// from --no-ban). Useful for private/trusted setups.
+	bool m_banningDisabled = false;
+
+	[[nodiscard]] bool banning_disabled() const { return m_banningDisabled; }
+
 	[[nodiscard]] bool is_banned(bool is_v6, raw_ip ip);
 
 	unordered_set<raw_ip> m_pendingConnections;

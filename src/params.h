@@ -127,6 +127,7 @@ struct Params
 	} m_socks5ProxyType = ProxyType::AUTO;
 
 	bool m_dns = true;
+	bool m_noBan = false;
 	int32_t m_p2pExternalPort = 0;
 #ifdef WITH_UPNP
 	bool m_upnp = true;
