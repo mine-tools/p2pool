@@ -26,6 +26,36 @@
 #define ROBIN_HOOD_CALLOC(count, size) p2pool::calloc_hook((count), (size))
 #define ROBIN_HOOD_FREE(ptr) p2pool::free_hook(ptr)
 
+extern "C" {
+#include "siphash/siphash.h"
+}
+
+namespace robin_hood {
+	struct SipHashKey {
+		enum { N = 16 / sizeof(std::random_device::result_type) };
+
+		SipHashKey() {
+			std::random_device rd;
+
+			for (size_t i = 0; i < N; ++i) {
+				data[i] = rd();
+			}
+		}
+
+		std::random_device::result_type data[N];
+	};
+
+	extern const SipHashKey SIPHASH_KEY;
+
+	FORCEINLINE size_t hash_bytes(const void* ptr, size_t len) noexcept {
+		size_t result;
+		uint8_t result_buf[sizeof(size_t)];
+		siphash(ptr, len, SIPHASH_KEY.data, result_buf, sizeof(result));
+		memcpy(&result, result_buf, sizeof(result));
+		return result;
+	}
+} // namespace robin_hood
+
 #include "robin_hood.h"
 #include "tor.h"
 
@@ -36,8 +66,8 @@
 namespace p2pool {
 
 #define P2POOL_VERSION_MAJOR 4
-#define P2POOL_VERSION_MINOR 16
-#define P2POOL_VERSION_PATCH 0
+#define P2POOL_VERSION_MINOR 17
+#define P2POOL_VERSION_PATCH 1
 
 constexpr uint32_t P2POOL_VERSION = (P2POOL_VERSION_MAJOR << 16) | (P2POOL_VERSION_MINOR << 8) | P2POOL_VERSION_PATCH;
 
@@ -141,17 +171,29 @@ static FORCEINLINE bool from_hex(const char* s, size_t len, std::vector<uint8_t>
 	return true;
 }
 
-template<typename T, bool is_signed> struct is_negative_helper {};
-template<typename T> struct is_negative_helper<T, false> { static FORCEINLINE bool value(T) { return false; } };
-template<typename T> struct is_negative_helper<T, true>  { static FORCEINLINE bool value(T x) { return (x < 0); } };
+template<typename T> FORCEINLINE constexpr bool is_negative(T x)
+{
+	if constexpr (std::is_signed_v<T>) {
+		return (x < 0);
+	}
+	else {
+		(void) x;
+		return false;
+	}
+}
 
-template<typename T> FORCEINLINE bool is_negative(T x) { return is_negative_helper<T, std::is_signed<T>::value>::value(x); }
+template<typename T> FORCEINLINE constexpr std::make_unsigned_t<T> abs(T x)
+{
+	static_assert(std::is_integral_v<T> && !std::is_same_v<T, bool>);
 
-template<typename T, bool is_signed> struct abs_helper {};
-template<typename T> struct abs_helper<T, false> { static FORCEINLINE T value(T x) { return x; } };
-template<typename T> struct abs_helper<T, true>  { static FORCEINLINE std::make_unsigned_t<T> value(T x) { return (x < 0) ? -x : x; } };
-
-template<typename T> FORCEINLINE std::make_unsigned_t<T> abs(T x) { return abs_helper<T, std::is_signed<T>::value>::value(x); }
+	if constexpr (std::is_signed_v<T>) {
+		const std::make_unsigned_t<T> ux = static_cast<std::make_unsigned_t<T>>(x);
+		MSVC_PRAGMA(warning(suppress:4146))
+		return (x < 0) ? -ux : ux;
+	} else {
+		return x;
+	}
+}
 
 template<typename T, typename U>
 FORCEINLINE void writeVarint(T value, U&& callback)
@@ -324,6 +366,31 @@ FORCEINLINE uint64_t bsr(uint64_t x)
 #define bsr bsr_reference
 #endif
 
+// Multiples of 64 when size <= 2048
+// Multiples of 128 when 2048 < size <= 4096
+// Multiples of 256 when 4096 < size <= 8192 and so on
+// 131072 will get index 127
+template<uint64_t MIN_GRANULARITY = 6, uint64_t BITS_TO_USE = 4>
+[[nodiscard]] FORCEINLINE uint64_t get_bucket_index(uint64_t size, uint64_t& adjusted_size)
+{
+	if (size == 0) {
+		adjusted_size = static_cast<uint64_t>(1u) << MIN_GRANULARITY;
+		return 0;
+	}
+
+	constexpr uint64_t TOTAL_BITS = MIN_GRANULARITY + BITS_TO_USE;
+
+	const uint64_t bit_index = bsr(size);
+
+	uint64_t n = std::max<uint64_t>(bit_index, TOTAL_BITS) - BITS_TO_USE;
+
+	const uint64_t mask = (static_cast<uint64_t>(1u) << n) - 1u;
+	adjusted_size = (size + mask) & ~mask;
+
+	n = std::max<uint64_t>(bit_index, TOTAL_BITS) - TOTAL_BITS;
+	return (adjusted_size >> (n + MIN_GRANULARITY)) + (n << BITS_TO_USE) - 1;
+}
+
 bool str_to_ip(bool is_v6, const char* ip, raw_ip& result);
 bool is_localhost(const std::string& host);
 
@@ -412,6 +479,13 @@ constexpr char base32_alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
 
 std::string to_onion_v3(const hash& pubkey);
 hash from_onion_v3(const std::string& address);
+
+// Returns a process-local keyed 64-bit digest. Collisions are possible.
+// Use only for tracking where memory is tight, collisions are non-fatal and cannot bypass validation or affect consensus.
+FORCEINLINE uint64_t hash64(const hash& h)
+{
+	return robin_hood::hash_bytes(h.h, HASH_SIZE);
+}
 
 std::vector<std::vector<std::string>> parse_config(const std::string& file_name);
 

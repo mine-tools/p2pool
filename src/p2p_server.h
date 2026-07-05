@@ -165,10 +165,6 @@ public:
 		uint64_t m_lastBroadcastTimestamp;
 		uint64_t m_lastBlockrequestTimestamp;
 
-		// Anti-spam broadcast throttle
-		uint64_t m_broadcastThrottleTimestamp;
-		uint64_t m_broadcastThrottleCounter;
-
 		hash m_broadcastedHashes[8];
 		uint32_t m_broadcastedHashesIndex;
 
@@ -210,7 +206,7 @@ public:
 
 	void broadcast(const PoolBlock& block, const PoolBlock* parent);
 	[[nodiscard]] uint64_t get_random64();
-	[[nodiscard]] uint64_t get_peerId(bool is_tor, bool is_i2p) const { return is_tor ? m_peerId_TOR : (is_i2p ? m_peerId_I2P : m_peerId); }
+	[[nodiscard]] uint64_t get_peerId(bool is_tor, bool is_i2p) const { return m_peerId[(is_tor ? 1 : 0) + (is_i2p ? 2 : 0)]; }
 
 	void print_status() override;
 	void show_peers_async();
@@ -220,11 +216,13 @@ public:
 
 	[[nodiscard]] uint32_t max_outgoing_peers() const { return m_maxOutgoingPeers; }
 	[[nodiscard]] uint32_t max_incoming_peers() const { return m_maxIncomingPeers; }
+	[[nodiscard]] uint32_t max_incoming_peers_localhost() const { return m_maxIncomingPeersLocalhost; }
 
 	void set_max_outgoing_peers(uint32_t n) { m_maxOutgoingPeers = std::min(std::max(n, 10U), 450U); }
 	void set_max_incoming_peers(uint32_t n) { m_maxIncomingPeers = std::min(std::max(n, 10U), 450U); }
+	void set_max_incoming_peers_localhost(uint32_t n) { m_maxIncomingPeersLocalhost = std::min(std::max(n, 10U), 450U); }
 
-	[[nodiscard]] int deserialize_block(const uint8_t* buf, uint32_t size, bool compact, uint64_t received_timestamp);
+	[[nodiscard]] int deserialize_block(const uint8_t* buf, uint32_t size, bool compact, bool allow_pruned, uint64_t received_timestamp);
 	[[nodiscard]] const PoolBlock* get_block() const { return m_block; }
 
 	[[nodiscard]] const PoolBlock* find_block(const hash& id) const;
@@ -244,6 +242,7 @@ public:
 	void broadcast_monero_block(const uint8_t* data, uint32_t data_size, const P2PClient* source, bool duplicate_check_done);
 
 	bool store_monero_block_broadcast(const hash& digest);
+	bool forget_monero_block_broadcast(const hash& digest);
 
 private:
 	[[nodiscard]] const char* get_log_category() const override;
@@ -254,6 +253,7 @@ private:
 	std::string m_initialPeerList;
 	uint32_t m_maxOutgoingPeers;
 	uint32_t m_maxIncomingPeers;
+	uint32_t m_maxIncomingPeersLocalhost;
 
 	uv_rwlock_t m_cachedBlocksLock;
 	unordered_map<hash, PoolBlock*>* m_cachedBlocks;
@@ -283,14 +283,14 @@ private:
 	PoolBlock* m_block;
 	std::vector<uint8_t> m_blockDeserializeBuf;
 	bool m_blockDeserializeBufCompact;
+	bool m_blockDeserializeBufAllowPruned;
 
 	uv_timer_t m_timer;
 	uint64_t m_timerCounter;
 	uint64_t m_timerInterval;
 
-	uint64_t m_peerId;
-	uint64_t m_peerId_TOR;
-	uint64_t m_peerId_I2P;
+	// Clearnet, TOR, I2P, TOR+I2P
+	uint64_t m_peerId[4];
 
 	mutable uv_mutex_t m_peerListLock;
 	uv_mutex_t m_peerListSaveLock;
@@ -384,10 +384,87 @@ private:
 
 	std::deque<std::string> m_MoneroBlocksToSubmit;
 
+	struct MoneroBlockBroadcastWork
+	{
+		uv_work_t req = {};
+
+		P2PServer* server = nullptr;
+		P2PClient* client = nullptr;
+
+		uint32_t reset_counter = 0;
+		bool is_v6 = false;
+		raw_ip addr;
+
+		RandomX_Hasher_Base* hasher = nullptr;
+
+		hash digest;
+
+		uint64_t height = 0;
+		hash seed;
+		difficulty_type diff;
+
+		std::vector<uint8_t> message;
+		uint32_t num_transactions = 0;
+		uint32_t tx_hashes_offset = 0;
+
+		bool pow_check_passed = false;
+		bool pow_check_failed = false;
+	};
+
+	// Can only be accessed on the P2P event loop thread
+	std::deque<MoneroBlockBroadcastWork*> m_pendingMoneroBlockBroadcasts;
+
 	static void on_monero_block_broadcast(uv_async_t* handle) { reinterpret_cast<P2PServer*>(handle->data)->broadcast_monero_block_handler(); }
+
+	static void monero_block_broadcast_work_cb(uv_work_t* req);
+	static void monero_block_broadcast_after_work_cb(uv_work_t* req, int status);
 
 	void clean_monero_block_broadcasts();
 	void submit_monero_blocks();
+
+	// Anti-spam broadcast throttle
+	struct BroadcastThrottle
+	{
+		BroadcastThrottle()
+			: m_startTime{}
+			, m_count{}
+		{}
+
+		// Time unit is 1 second for a default sidechain config.
+		// It can vary depending on the sidechain (i.e. it's 3 seconds for p2pool-nano)
+		static constexpr uint64_t LIMITS[][2] = {
+			{   1,  10 }, // no more than  10 broadcasts in   1 time unit  (100x the normal block rate)
+			{  60,  60 }, // no more than  60 broadcasts in  60 time units ( 10x the normal block rate)
+			{ 600, 180 }, // no more than 180 broadcasts in 600 time units (  3x the normal block rate)
+		};
+
+		enum { N = array_size(LIMITS) };
+
+		static constexpr bool check_limits() {
+			for (int i = 0; i < N; ++i) {
+				for (int j = 0; j < 2; ++j) {
+					// Can't be zero or too big
+					if (!LIMITS[i][j] || (LIMITS[i][j] > 100000)) {
+						return false;
+					}
+
+					// Both timeout and max number of broadcasts must be increasing
+					if (i && (LIMITS[i][j] <= LIMITS[i - 1][j])) {
+						return false;
+					}
+				}
+			}
+			return true;
+		}
+
+		uint64_t m_startTime[N];
+		uint32_t m_count[N];
+	};
+
+	unordered_map<hash, BroadcastThrottle> m_broadcastThrottle;
+
+	void clean_broadcast_throttle_data();
+	bool throttle_broadcast(const P2PClient* client, uint64_t timestamp_mcs);
 };
 
 } // namespace p2pool

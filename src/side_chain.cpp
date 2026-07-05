@@ -34,6 +34,7 @@
 #include "json_parsers.h"
 #include "crypto.h"
 #include "hardforks/hardforks.h"
+#include "pow_hash.h"
 
 #if !defined(_MSC_VER) || !defined(__cppcheck__)
 #include <rapidjson/document.h>
@@ -49,9 +50,9 @@ LOG_CATEGORY(SideChain)
 static constexpr uint64_t MIN_DIFFICULTY = 100000;
 static constexpr size_t UNCLE_BLOCK_DEPTH = 3;
 
-static_assert(1 <= UNCLE_BLOCK_DEPTH && UNCLE_BLOCK_DEPTH <= 10, "Invalid UNCLE_BLOCK_DEPTH");
+static constexpr uint64_t MAX_PPLNS_WINDOW_HOURS = 30;
 
-static constexpr uint64_t MONERO_BLOCK_TIME = 120;
+static_assert(1 <= UNCLE_BLOCK_DEPTH && UNCLE_BLOCK_DEPTH <= 10, "Invalid UNCLE_BLOCK_DEPTH");
 
 namespace p2pool {
 
@@ -566,7 +567,7 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 		}
 	}
 
-	LOGINFO(4, "add_external_block: height = " << block.m_sidechainHeight << ", id = " << block.m_sidechainId << ", mainchain height = " << block.m_txinGenHeight);
+	LOGINFO(4, "add_external_block: height = " << block.m_sidechainHeight << ", id = " << block.m_sidechainId << ", mainchain height = " << block.m_txinGenHeight << ", difficulty = " << block.m_difficulty);
 
 	if (too_low_diff) {
 		LOGWARN(4, "add_external_block: block mined by " << block.m_minerWallet << " has too low difficulty " << block.m_difficulty << ", expected >= ~" << expected_diff << ". Ignoring it.");
@@ -591,7 +592,7 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 		return false;
 	}
 
-	if (!block.get_pow_hash(m_pool->hasher(), block.m_txinGenHeight, block.m_seed, block.m_powHash)) {
+	if (!block.get_pow_hash(m_pool->hasher(), block.m_txinGenHeight, block.m_seed, block.m_powHash, false, RandomX_Hasher_Base::VM_LANE_P2P)) {
 		LOGWARN(3, "add_external_block: couldn't get PoW hash for height = " << block.m_sidechainHeight << ", mainchain height " << block.m_txinGenHeight << ". Ignoring it.");
 		forget_incoming_block(block);
 		return true;
@@ -627,7 +628,7 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 
 		// Calculate the same hash second time to check if it's an unstable hardware that caused this
 		hash pow_hash2;
-		if (block.get_pow_hash(m_pool->hasher(), block.m_txinGenHeight, block.m_seed, pow_hash2, true) && (pow_hash2 != block.m_powHash)) {
+		if (block.get_pow_hash(m_pool->hasher(), block.m_txinGenHeight, block.m_seed, pow_hash2, true, RandomX_Hasher_Base::VM_LANE_P2P) && (pow_hash2 != block.m_powHash)) {
 			LOGERR(0, "UNSTABLE HARDWARE DETECTED: Calculated the same hash twice, got different results: " << block.m_powHash << " != " << pow_hash2 << " (sidechain id = " << block.m_sidechainId << ')');
 			if (block.m_difficulty.check_pow(pow_hash2)) {
 				LOGINFO(3, "add_external_block second result has enough PoW for height = " << block.m_sidechainHeight << ", id = " << block.m_sidechainId);
@@ -799,6 +800,18 @@ void SideChain::watch_mainchain_block(const ChainMain& data, const hash& possibl
 	WriteLock lock(m_watchBlockLock);
 	m_watchBlock = data;
 	m_watchBlockMerkleRoot = possible_merkle_root;
+}
+
+difficulty_type SideChain::get_cached_next_difficulty(const hash& id) const
+{
+	ReadLock lock(m_sidechainLock);
+
+	auto it = m_blocksById.find(id);
+	if (it != m_blocksById.end()) {
+		return it->second->m_cachedNextDifficulty;
+	}
+
+	return {};
 }
 
 const PoolBlock* SideChain::get_block_blob(const hash& id, std::vector<uint8_t>& blob) const
@@ -1296,8 +1309,13 @@ bool SideChain::split_reward(uint64_t reward, const std::vector<MinerShare>& sha
 	return true;
 }
 
-bool SideChain::get_difficulty(const PoolBlock* tip, std::vector<DifficultyData>& difficultyData, difficulty_type& curDifficulty) const
+bool SideChain::get_difficulty(const PoolBlock* const tip, std::vector<DifficultyData>& difficultyData, difficulty_type& curDifficulty) const
 {
+	if (!pool_block_debug() && !tip->m_cachedNextDifficulty.empty()) {
+		curDifficulty = tip->m_cachedNextDifficulty;
+		return true;
+	}
+
 	difficultyData.clear();
 
 	const PoolBlock* cur = tip;
@@ -1347,11 +1365,18 @@ bool SideChain::get_difficulty(const PoolBlock* tip, std::vector<DifficultyData>
 	std::vector<uint32_t> tmpTimestamps;
 	tmpTimestamps.reserve(difficultyData.size());
 
-	std::transform(difficultyData.begin(), difficultyData.end(), std::back_inserter(tmpTimestamps),
-		[oldest_timestamp](const DifficultyData& d)
-		{
-			return static_cast<uint32_t>(d.m_timestamp - oldest_timestamp);
-		});
+	// Sanity check for the overall timestamp range
+	for (const DifficultyData& d : difficultyData) {
+		const uint64_t dt = d.m_timestamp - oldest_timestamp;
+
+		if (dt > std::numeric_limits<uint32_t>::max()) {
+			LOGWARN(3, "get_difficulty: too large timestamp delta " << dt);
+			LOGWARN(3, "get_difficulty: can't calculate diff for block at height = " << tip->m_sidechainHeight << ", id = " << tip->m_sidechainId << ", mainchain height = " << tip->m_txinGenHeight);
+			return false;
+		}
+
+		tmpTimestamps.emplace_back(static_cast<uint32_t>(dt));
+	}
 
 	const uint64_t cut_size = (difficultyData.size() + 9) / 10;
 	const uint64_t index1 = cut_size - 1;
@@ -1367,7 +1392,7 @@ bool SideChain::get_difficulty(const PoolBlock* tip, std::vector<DifficultyData>
 	// Because if it is, someone is trying to mess with timestamps
 	// In reality, delta_t ~ delta_index*10 (sidechain block time)
 	const uint64_t delta_index = (index2 > index1) ? (index2 - index1) : 1U;
-	const uint64_t delta_t = (timestamp2 > timestamp1 + delta_index) ? (timestamp2 - timestamp1) : delta_index;
+	const uint64_t delta_t = std::max<uint64_t>((timestamp2 > timestamp1) ? (timestamp2 - timestamp1) : 0U, delta_index);
 
 	difficulty_type diff1{ std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max() };
 	difficulty_type diff2{ 0, 0 };
@@ -1388,6 +1413,11 @@ bool SideChain::get_difficulty(const PoolBlock* tip, std::vector<DifficultyData>
 	if (curDifficulty < m_minDifficulty) {
 		curDifficulty = m_minDifficulty;
 	}
+
+	if (pool_block_debug() && !tip->m_cachedNextDifficulty.empty() && (tip->m_cachedNextDifficulty != curDifficulty)) {
+		LOGERR(1, "SideChain::get_difficulty: difficulty caching is broken. Fix the code!");
+	}
+	tip->m_cachedNextDifficulty = curDifficulty;
 
 	return true;
 }
@@ -1604,10 +1634,20 @@ void SideChain::verify(PoolBlock* block)
 
 	// Deep block
 	//
-	// Blocks in PPLNS window (m_chainWindowSize) require up to m_chainWindowSize earlier blocks to verify
-	// If a block is deeper than (m_chainWindowSize - 1) * 2 + UNCLE_BLOCK_DEPTH it can't influence blocks in PPLNS window
-	// Also, having so many blocks on top of this one means it was verified by the network at some point
+	// Having so many blocks on top of this one means it was verified by the network at some point
 	// We skip checks in this case to make pruning possible
+	//
+	// Blocks in PPLNS window (m_chainWindowSize = W) require up to m_chainWindowSize earlier blocks to verify
+	// Each block at depth N can also have uncle blocks at depths from N + 1 up to N + UNCLE_BLOCK_DEPTH (U)
+	//
+	// If a block is deeper than "2*W-1" it can't influence blocks in PPLNS window:
+	//
+	// get_difficulty requires uncle blocks to exist up to "2*W-1+U" depth, but only uses values of blocks at "<= 2*W-1" depth
+	// get_shares has the same constraints but starts 1 block higher, so it requires 1 less depth
+	//
+	// (W-1)*2 + U = W*2-2+U >= 2*W-1 if U >= 1
+	// So if U >= 1, block's depth here will be > 2*W - 1
+	//
 	if (block->m_depth > (m_chainWindowSize - 1) * 2 + UNCLE_BLOCK_DEPTH) {
 		LOGINFO(4, "block " << block->m_sidechainId << " skipped verification");
 		block->m_verified = true;
@@ -1991,7 +2031,7 @@ PoolBlock* SideChain::get_parent(const PoolBlock* block) const
 	return (it != m_blocksById.end()) ? it->second : nullptr;
 }
 
-bool SideChain::is_longer_chain(const PoolBlock* block, const PoolBlock* candidate, bool& is_alternative) const
+bool SideChain::is_longer_chain(const PoolBlock* const block, const PoolBlock* const candidate, bool& is_alternative) const
 {
 	is_alternative = false;
 
@@ -2063,52 +2103,76 @@ bool SideChain::is_longer_chain(const PoolBlock* block, const PoolBlock* candida
 	uint64_t candidate_mainchain_min_height = 0;
 
 	unordered_set<hash> current_chain_monero_blocks, candidate_chain_monero_blocks;
+	std::vector<uint64_t> candidate_timestamps;
 	{
 		const uint64_t k = m_chainWindowSize * m_targetBlockTime * 2 / MONERO_BLOCK_TIME;
 		current_chain_monero_blocks.reserve(k);
 		candidate_chain_monero_blocks.reserve(k);
+		candidate_timestamps.reserve(m_chainWindowSize * 2);
 	}
+
+	uint64_t candidate_ts_deviation = 0;
 
 	for (uint64_t i = 0; (i < m_chainWindowSize) && (old_chain || new_chain); ++i) {
 		if (old_chain) {
 			block_total_diff += old_chain->m_difficulty;
 
+			auto add_monero_block_from = [this, &current_chain_monero_blocks](const hash& h) {
+				ChainMain data;
+				if ((current_chain_monero_blocks.count(h) == 0) && m_pool->chainmain_get_by_hash(h, data)) {
+					current_chain_monero_blocks.insert(h);
+				}
+			};
+
 			for (const hash& uncle : old_chain->m_uncles) {
 				auto it = m_blocksById.find(uncle);
-				if (it != m_blocksById.end()) {
+				if ((it != m_blocksById.end()) && (block->m_sidechainHeight - it->second->m_sidechainHeight < m_chainWindowSize)) {
 					block_total_diff += it->second->m_difficulty;
+					add_monero_block_from(it->second->m_prevId);
 				}
 			}
 
-			ChainMain data;
-			const hash& h = old_chain->m_prevId;
-
-			if ((current_chain_monero_blocks.count(h) == 0) && m_pool->chainmain_get_by_hash(h, data)) {
-				current_chain_monero_blocks.insert(h);
-			}
-
+			add_monero_block_from(old_chain->m_prevId);
 			old_chain = get_parent(old_chain);
 		}
 
 		if (new_chain) {
 			candidate_mainchain_min_height = candidate_mainchain_min_height ? std::min(candidate_mainchain_min_height, new_chain->m_txinGenHeight) : new_chain->m_txinGenHeight;
 			candidate_total_diff += new_chain->m_difficulty;
+			candidate_timestamps.emplace_back(new_chain->m_timestamp);
+
+			auto add_monero_block_from = [this, &candidate_chain_monero_blocks, &candidate_mainchain_height, &candidate_ts_deviation](const hash& h, uint64_t timestamp) {
+				ChainMain data;
+				if (!m_pool->chainmain_get_by_hash(h, data)) {
+					return;
+				}
+
+				// Can it be zero? Most likely not, but just in case check it first...
+				if (data.timestamp) {
+					const uint64_t diff = (timestamp > data.timestamp) ? (timestamp - data.timestamp) : (data.timestamp - timestamp);
+
+					if (candidate_ts_deviation < diff) {
+						candidate_ts_deviation = diff;
+					}
+				}
+
+				if (candidate_chain_monero_blocks.count(h) == 0) {
+					candidate_chain_monero_blocks.insert(h);
+					candidate_mainchain_height = std::max(candidate_mainchain_height, data.height);
+				}
+			};
 
 			for (const hash& uncle : new_chain->m_uncles) {
 				auto it = m_blocksById.find(uncle);
-				if (it != m_blocksById.end()) {
+				if ((it != m_blocksById.end()) && (candidate->m_sidechainHeight - it->second->m_sidechainHeight < m_chainWindowSize)) {
+					candidate_mainchain_min_height = std::min(candidate_mainchain_min_height, it->second->m_txinGenHeight);
 					candidate_total_diff += it->second->m_difficulty;
+					candidate_timestamps.emplace_back(it->second->m_timestamp);
+					add_monero_block_from(it->second->m_prevId, it->second->m_timestamp);
 				}
 			}
 
-			ChainMain data;
-			const hash& h = new_chain->m_prevId;
-
-			if ((candidate_chain_monero_blocks.count(h) == 0) && m_pool->chainmain_get_by_hash(h, data)) {
-				candidate_chain_monero_blocks.insert(h);
-				candidate_mainchain_height = std::max(candidate_mainchain_height, data.height);
-			}
-
+			add_monero_block_from(new_chain->m_prevId, new_chain->m_timestamp);
 			new_chain = get_parent(new_chain);
 		}
 	}
@@ -2124,15 +2188,61 @@ bool SideChain::is_longer_chain(const PoolBlock* block, const PoolBlock* candida
 		return false;
 	}
 
-	const uint64_t limit = m_chainWindowSize * 4 * m_targetBlockTime / MONERO_BLOCK_TIME;
+	const uint64_t limit = monero_headers_required();
 	if (candidate_mainchain_min_height + limit < data.height) {
 		LOGWARN(3, "received a longer alternative chain but it's stale: min height " << candidate_mainchain_min_height << ", must be >= " << (data.height - limit));
 		return false;
 	}
 
 	// Candidate chain must have been mined on top of at least half as many known Monero blocks, compared to the current chain
-	if (candidate_chain_monero_blocks.size() * 2 < current_chain_monero_blocks.size()) {
+	if ((candidate_chain_monero_blocks.size() * 2 < current_chain_monero_blocks.size()) || (candidate_mainchain_height < candidate_mainchain_min_height)) {
 		LOGWARN(3, "received a longer alternative chain but it wasn't mined on current Monero blockchain: only " << candidate_chain_monero_blocks.size() << '/' << current_chain_monero_blocks.size() << " blocks found");
+		return false;
+	}
+
+	// Candidate chain's timestamps must not be altered to fake a high-difficulty chain
+	if (candidate_ts_deviation > 10800u) {
+		LOGWARN(3, "received a longer alternative chain but it was mined with fake timestamps: max deviation is " << candidate_ts_deviation << " seconds");
+		return false;
+	}
+
+	// Returns "90th percentile value - 10th percentile value" of a given vector when the values are sorted in non-decreasing order
+	auto span80 = [](std::vector<uint64_t>& v) -> uint64_t {
+		// Handle a degenerate case
+		if (v.empty()) {
+			return 0;
+		}
+
+		const uint64_t cut_size = (v.size() + 9) / 10;
+
+		const uint64_t pos1 = cut_size - 1;
+		const uint64_t pos2 = v.size() - cut_size;
+
+		// Handle the rest of degenerate cases
+		if (pos1 >= pos2) {
+			return 0;
+		}
+
+		std::nth_element(v.begin(), v.begin() + static_cast<uint32_t>(pos1), v.end());
+		const uint64_t v1 = v[pos1];
+
+		std::nth_element(v.begin(), v.begin() + static_cast<uint32_t>(pos2), v.end());
+		const uint64_t v2 = v[pos2];
+
+		return v2 - v1;
+	};
+
+	// Candidate's span is based on timestamps
+	const uint64_t candidate_span = span80(candidate_timestamps);
+
+	// Monero's span is based on blockchain heights and block time (also reduced to 80%).
+	// This is to anchor the span to the most recent Monero block in candidate's chain
+	const uint64_t candidate_monero_span = (candidate_mainchain_height + 1 - candidate_mainchain_min_height) * MONERO_BLOCK_TIME * 8 / 10;
+
+	// Candidate's timestamps span must be between 2/3 and 4/3 of Monero's timestamps span
+	if ((candidate_span > std::numeric_limits<uint64_t>::max() / 3) || // overflow check
+		(candidate_span * 3 < candidate_monero_span * 2) || (candidate_span * 3 > candidate_monero_span * 4)) {
+		LOGWARN(3, "received a longer alternative chain but it was mined with fake timestamps: span " << candidate_span << " vs Monero span " << candidate_monero_span);
 		return false;
 	}
 
@@ -2167,10 +2277,11 @@ void SideChain::update_depths(PoolBlock* block)
 		for (const PoolBlock* child : it->second) {
 			if (child->m_parent == block->m_sidechainId) {
 				if (i != 1) {
-					LOGWARN(3, "Block " << block->m_sidechainId << ": m_sidechainHeight is inconsistent with child's m_sidechainHeight.");
-					return;
+					LOGWARN(4, "Block " << block->m_sidechainId << ": m_sidechainHeight is inconsistent with child's m_sidechainHeight.");
 				}
-				update_depth(block, child->m_depth + 1);
+				else {
+					update_depth(block, child->m_depth + 1);
+				}
 			}
 
 			if (std::find(child->m_uncles.begin(), child->m_uncles.end(), block->m_sidechainId) != child->m_uncles.end()) {
@@ -2208,10 +2319,9 @@ void SideChain::update_depths(PoolBlock* block)
 
 				if (child->m_parent == block->m_sidechainId) {
 					if (i != 1) {
-						LOGWARN(3, "Block " << block->m_sidechainId << ": m_sidechainHeight is inconsistent with child's m_sidechainHeight.");
-						return;
+						LOGWARN(4, "Block " << block->m_sidechainId << ": m_sidechainHeight is inconsistent with child's m_sidechainHeight.");
 					}
-					if (block->m_depth > 0) {
+					else if (block->m_depth > 0) {
 						update_depth(child, block->m_depth - 1);
 					}
 				}
@@ -2231,11 +2341,9 @@ void SideChain::update_depths(PoolBlock* block)
 		auto it = m_blocksById.find(block->m_parent);
 		if (it != m_blocksById.end()) {
 			if (it->second->m_sidechainHeight + 1 != block->m_sidechainHeight) {
-				LOGWARN(3, "Block " << block->m_sidechainId << ": m_sidechainHeight is inconsistent with parent's m_sidechainHeight.");
-				return;
+				LOGWARN(4, "Block " << block->m_sidechainId << ": m_sidechainHeight is inconsistent with parent's m_sidechainHeight.");
 			}
-
-			if (it->second->m_depth < block->m_depth + 1) {
+			else if (it->second->m_depth < block->m_depth + 1) {
 				update_depth(it->second, block->m_depth + 1);
 				blocks_to_update.push_back(it->second);
 			}
@@ -2248,8 +2356,8 @@ void SideChain::update_depths(PoolBlock* block)
 			}
 
 			if ((it->second->m_sidechainHeight >= block->m_sidechainHeight) || (it->second->m_sidechainHeight + UNCLE_BLOCK_DEPTH < block->m_sidechainHeight)) {
-				LOGWARN(3, "Block " << block->m_sidechainId << ": m_sidechainHeight is inconsistent with uncle's m_sidechainHeight.");
-				return;
+				LOGWARN(4, "Block " << block->m_sidechainId << ": m_sidechainHeight is inconsistent with uncle's m_sidechainHeight.");
+				continue;
 			}
 
 			const uint64_t d = block->m_sidechainHeight - it->second->m_sidechainHeight;
@@ -2495,6 +2603,13 @@ bool SideChain::check_config() const
 
 	if ((m_unclePenalty < 1) || (m_unclePenalty > 99)) {
 		LOGERR(1, "uncle_penalty is invalid (must be between 1 and 99)");
+		return false;
+	}
+
+	// When the nominal PPLNS window is more than 30 hours, the random 2x PPLNS sync horizon
+	// can span more than 2048 Monero blocks and require a RandomX seed older than the hasher keeps.
+	if (m_chainWindowSize * m_targetBlockTime > MAX_PPLNS_WINDOW_HOURS * 3600u) {
+		LOGERR(1, "PPLNS window is too large (more than " << MAX_PPLNS_WINDOW_HOURS << " hours), this is unsafe");
 		return false;
 	}
 

@@ -25,6 +25,8 @@
 
 namespace p2pool {
 
+static constexpr uint64_t MONERO_BLOCK_TIME = 120;
+
 class p2pool;
 class P2PServer;
 
@@ -57,6 +59,8 @@ public:
 	[[nodiscard]] const PoolBlock* find_block(const hash& id) const;
 	[[nodiscard]] const PoolBlock* find_block_by_merkle_root(const root_hash& merkle_root) const;
 	void watch_mainchain_block(const ChainMain& data, const hash& possible_merkle_root);
+
+	[[nodiscard]] difficulty_type get_cached_next_difficulty(const hash& id) const;
 
 	[[nodiscard]] const PoolBlock* get_block_blob(const hash& id, std::vector<uint8_t>& blob) const;
 	[[nodiscard]] bool get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::vector<uint8_t>& blob, uv_loop_t* loop) const;
@@ -101,6 +105,8 @@ public:
 #endif
 
 	[[nodiscard]] static bool split_reward(uint64_t reward, const std::vector<MinerShare>& shares, std::vector<uint64_t>& rewards);
+
+	[[nodiscard]] FORCEINLINE uint64_t monero_headers_required() const { return m_chainWindowSize * 4 * m_targetBlockTime / MONERO_BLOCK_TIME; }
 
 private:
 	p2pool* m_pool;
@@ -192,7 +198,7 @@ namespace robin_hood {
 	{
 		FORCEINLINE size_t operator()(const p2pool::MinerShare& value) const noexcept
 		{
-			return hash_bytes(value.m_wallet->spend_public_key().h, p2pool::HASH_SIZE);
+			return hash_bytes(value.m_wallet->keys(), p2pool::HASH_SIZE * 2);
 		}
 	};
 

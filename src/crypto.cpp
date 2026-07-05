@@ -19,6 +19,7 @@
 #include "crypto.h"
 #include "keccak.h"
 #include "uv_util.h"
+#include <map>
 
 extern "C" {
 #include "crypto-ops.h"
@@ -163,12 +164,13 @@ public:
 
 		derive_view_tag(derivation, output_index, view_tag);
 
-		const uint64_t t = seconds_since_epoch();
+		const uint32_t t = static_cast<uint32_t>(seconds_since_epoch());
 		{
 			WriteLock lock(derivations_lock);
 
-			auto entry = derivations->emplace(index, DerivationEntry{ derivation, { 0xFFFFFFFFUL, 0xFFFFFFFFUL }, {}, static_cast<uint32_t>(t) }).first;
+			auto entry = derivations->emplace(index, DerivationEntry(derivation, t)).first;
 			entry->second.add_view_tag(static_cast<uint32_t>(output_index << 8) | view_tag);
+			limit_size(derivations, 1'000'000, 500'000);
 		}
 
 		return true;
@@ -208,10 +210,11 @@ public:
 		ge_p1p1_to_p2(&point5, &point4);
 		ge_tobytes(derived_key.h, &point5);
 
-		const uint64_t t = seconds_since_epoch();
+		const uint32_t t = static_cast<uint32_t>(seconds_since_epoch());
 		{
 			WriteLock lock(public_keys_lock);
-			public_keys->emplace(index, PublicKeyEntry{ static_cast<indexed_hash>(derived_key), static_cast<uint32_t>(t) });
+			public_keys->emplace(index, PublicKeyEntry{ static_cast<indexed_hash>(derived_key), t });
+			limit_size(public_keys, 1'000'000, 500'000);
 		}
 
 		return true;
@@ -243,39 +246,82 @@ public:
 
 		generate_keys_deterministic(pub, sec, entropy, sizeof(entropy));
 
-		const uint64_t t = seconds_since_epoch();
+		const uint32_t t = static_cast<uint32_t>(seconds_since_epoch());
 		{
 			WriteLock lock(tx_keys_lock);
-			tx_keys->emplace(index, TxKeyEntry{ pub, sec, static_cast<uint32_t>(t) });
+			tx_keys->emplace(index, TxKeyEntry{ pub, sec, t });
+			limit_size(tx_keys, 10'000, 5'000);
+		}
+	}
+
+	// Must be called with an appropriate lock held
+	template<typename T>
+	static void clean_old(T* table, uint32_t timestamp, size_t excess_at_timestamp = 0) {
+		for (auto it = table->begin(); it != table->end();) {
+			const uint32_t t = it->second.m_timestamp;
+			bool remove;
+
+			if ((excess_at_timestamp > 0) && (t == timestamp)) {
+				remove = true;
+				--excess_at_timestamp;
+			}
+			else {
+				// Wraparound-safe way of checking "it->second.m_timestamp < timestamp"
+				remove = (((t - timestamp) & 0x80000000UL) != 0);
+			}
+
+			if (remove) {
+				it = table->erase(it);
+			}
+			else {
+				++it;
+			}
+		}
+	};
+
+	// Must be called with an appropriate lock held
+	// If the table exceeded max_size, deletes oldest entries to shrink the table to <= max_new_size entries
+	template<typename T>
+	static void limit_size(T* table, size_t max_size, size_t max_new_size)
+	{
+		if (table->size() <= max_size) {
+			return;
+		}
+
+		const uint32_t now = static_cast<uint32_t>(seconds_since_epoch());
+		std::map<uint32_t, size_t> ages;
+
+		for (const auto& data : *table) {
+			++ages[now - data.second.m_timestamp];
+		}
+
+		size_t k = 0;
+
+		for (auto it = ages.begin(); it != ages.end(); ++it) {
+			k += it->second;
+
+			if (k >= max_new_size) {
+				clean_old(table, now - it->first, k - max_new_size);
+				return;
+			}
 		}
 	}
 
 	void clear(uint64_t timestamp)
 	{
 		if (timestamp) {
-			auto clean_old = [timestamp](auto* table) {
-				for (auto it = table->begin(); it != table->end();) {
-					// Wraparound-safe way of checking "it->second.m_timestamp < timestamp"
-					if (((it->second.m_timestamp - static_cast<uint32_t>(timestamp)) & 0x80000000UL) != 0) {
-						it = table->erase(it);
-					}
-					else {
-						++it;
-					}
-				}
-			};
-
+			const uint32_t t = static_cast<uint32_t>(timestamp);
 			{
 				WriteLock lock(derivations_lock);
-				clean_old(derivations);
+				clean_old(derivations, t);
 			}
 			{
 				WriteLock lock(public_keys_lock);
-				clean_old(public_keys);
+				clean_old(public_keys, t);
 			}
 			{
 				WriteLock lock(tx_keys_lock);
-				clean_old(tx_keys);
+				clean_old(tx_keys, t);
 			}
 			return;
 		}
@@ -303,27 +349,26 @@ public:
 private:
 	struct DerivationEntry
 	{
+		FORCEINLINE DerivationEntry(const hash& derivation, uint32_t timestamp)
+			: m_derivation(derivation)
+			, m_viewTags{ TAG_NONE, TAG_NONE, TAG_NONE, TAG_NONE, TAG_NONE, TAG_NONE, TAG_NONE }
+			, m_timestamp(timestamp)
+		{}
+
+		static constexpr uint32_t TAG_NONE = 0xFFFFFFFFUL;
+
 		hash m_derivation;
-		uint32_t m_viewTags1[2] = { 0xFFFFFFFFUL, 0xFFFFFFFFUL };
-		std::vector<uint32_t> m_viewTags2;
+		uint32_t m_viewTags[7];
 		// cppcheck-suppress unusedStructMember
-		uint32_t m_timestamp = 0;
+		uint32_t m_timestamp;
 
 		FORCEINLINE bool find_view_tag(size_t output_index, uint8_t& view_tag) const
 		{
-#define ITER(i) do { \
-				const uint32_t k = m_viewTags1[i]; \
-				if ((k >> 8) == output_index) { \
-					view_tag = static_cast<uint8_t>(k); \
-					return true; \
-				} \
-			} while(0)
+			for (const uint32_t k : m_viewTags) {
+				if (k == TAG_NONE) {
+					return false;
+				}
 
-			ITER(0);
-			ITER(1);
-#undef ITER
-
-			for (const uint32_t k : m_viewTags2) {
 				if ((k >> 8) == output_index) {
 					view_tag = static_cast<uint8_t>(k);
 					return true;
@@ -334,26 +379,22 @@ private:
 
 		FORCEINLINE void add_view_tag(uint32_t k)
 		{
-#define ITER(i) do { \
-				const uint32_t t = m_viewTags1[i]; \
-				if (t == 0xFFFFFFFFUL) { \
-					m_viewTags1[i] = k; \
-					return; \
-				} \
-				if (t == k) { \
-					return; \
-				} \
-			} while (0)
+			for (size_t i = 0, n = array_size(m_viewTags); i < n; ++i) {
+				const uint32_t t = m_viewTags[i];
 
-			ITER(0);
-			ITER(1);
-#undef ITER
+				if (t == TAG_NONE) {
+					m_viewTags[i] = k;
+					return;
+				}
 
-			if (std::find(m_viewTags2.begin(), m_viewTags2.end(), k) == m_viewTags2.end()) {
-				m_viewTags2.emplace_back(k);
+				if (t == k) {
+					return;
+				}
 			}
 		}
 	};
+
+	static_assert(sizeof(DerivationEntry) == 64, "Invalid DerivationEntry size");
 
 	struct PublicKeyEntry
 	{

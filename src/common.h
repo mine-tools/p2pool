@@ -23,7 +23,12 @@
 #define FORCEINLINE __forceinline
 #define NOINLINE __declspec(noinline)
 #define LIKELY(expression) expression
+
+#ifndef __cppcheck__
 #define MSVC_PRAGMA(...) __pragma(__VA_ARGS__)
+#else
+#define MSVC_PRAGMA(...)
+#endif
 
 #elif __GNUC__
 
@@ -277,7 +282,9 @@ struct
 #ifdef _MSC_VER
 		_addcarry_u64(_addcarry_u64(0, lo, b.lo, &lo), hi, b.hi, &hi);
 #elif defined(__GNUC__) && !defined(DEV_CLANG_TIDY)
-		*reinterpret_cast<unsigned __int128*>(this) += *reinterpret_cast<const unsigned __int128*>(&b);
+		const unsigned __int128 result = ((static_cast<unsigned __int128>(hi) << 64) | lo) + ((static_cast<unsigned __int128>(b.hi) << 64) | b.lo);
+		lo = static_cast<uint64_t>(result);
+		hi = static_cast<uint64_t>(result >> 64);
 #else
 		const uint64_t t = lo;
 		lo += b.lo;
@@ -294,7 +301,9 @@ struct
 #ifdef _MSC_VER
 		_subborrow_u64(_subborrow_u64(0, lo, b.lo, &lo), hi, b.hi, &hi);
 #elif defined(__GNUC__) && !defined(DEV_CLANG_TIDY)
-		*reinterpret_cast<unsigned __int128*>(this) -= *reinterpret_cast<const unsigned __int128*>(&b);
+		const unsigned __int128 result = ((static_cast<unsigned __int128>(hi) << 64) | lo) - ((static_cast<unsigned __int128>(b.hi) << 64) | b.lo);
+		lo = static_cast<uint64_t>(result);
+		hi = static_cast<uint64_t>(result >> 64);
 #else
 		const uint64_t t = b.lo;
 		const uint64_t carry = (lo < t) ? 1 : 0;
@@ -595,26 +604,7 @@ struct raw_ip
 {
 	alignas(8) uint8_t data[16] = {};
 
-	FORCEINLINE bool operator<(const raw_ip& other) const
-	{
-		const uint64_t* a = reinterpret_cast<const uint64_t*>(data);
-		const uint64_t* b = reinterpret_cast<const uint64_t*>(other.data);
-
-		if (a[1] < b[1]) return true;
-		if (a[1] > b[1]) return false;
-
-		return a[0] < b[0];
-	}
-
-	FORCEINLINE bool operator==(const raw_ip& other) const
-	{
-		const uint64_t* a = reinterpret_cast<const uint64_t*>(data);
-		const uint64_t* b = reinterpret_cast<const uint64_t*>(other.data);
-
-		return (a[0] == b[0]) && (a[1] == b[1]);
-	}
-
-	FORCEINLINE bool operator!=(const raw_ip& other) const { return !operator==(other); }
+	FORCEINLINE bool operator==(const raw_ip& other) const { return memcmp(data, other.data, sizeof(data)) == 0; }
 
 	FORCEINLINE bool is_localhost() const { return (*this == localhost_ipv4) || (*this == localhost_ipv6); }
 	FORCEINLINE bool is_ipv4_prefix() const { return memcmp(data, ipv4_prefix, sizeof(ipv4_prefix)) == 0; }

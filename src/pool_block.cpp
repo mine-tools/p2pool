@@ -132,6 +132,8 @@ PoolBlock& PoolBlock::operator=(const PoolBlock& b)
 	m_powHash = b.m_powHash;
 	m_seed = b.m_seed;
 
+	m_cachedNextDifficulty = b.m_cachedNextDifficulty;
+
 	return *this;
 }
 
@@ -342,9 +344,11 @@ void PoolBlock::reset_offchain_data()
 
 	m_powHash = {};
 	m_seed = {};
+
+	m_cachedNextDifficulty = {};
 }
 
-bool PoolBlock::get_pow_hash(RandomX_Hasher_Base* hasher, uint64_t height, const hash& seed_hash, hash& pow_hash, bool force_light_mode)
+bool PoolBlock::get_pow_hash(RandomX_Hasher_Base* hasher, uint64_t height, const hash& seed_hash, hash& pow_hash, bool force_light_mode, size_t lane)
 {
 	if (m_transactions.empty()) {
 		LOGERR(1, "Trying to calculate PoW hash of an uninitialized block, fix the code!");
@@ -419,7 +423,7 @@ bool PoolBlock::get_pow_hash(RandomX_Hasher_Base* hasher, uint64_t height, const
 	// cppcheck-suppress danglingLifetime
 	m_hashingBlob.assign(blob, blob + blob_size);
 
-	return hasher->calculate(blob, blob_size, height, seed_hash, pow_hash, force_light_mode);
+	return hasher->calculate(blob, blob_size, height, seed_hash, pow_hash, force_light_mode, lane);
 }
 
 uint64_t PoolBlock::get_payout(const Wallet& w) const

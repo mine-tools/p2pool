@@ -134,15 +134,27 @@ private:
 	p2pool* m_pool;
 	bool m_autoDiff;
 	bool m_enableFullValidation;
+
 	struct BlobsData
 	{
-		uint32_t m_extraNonceStart = 0;
 		std::vector<uint8_t> m_blobs;
+		std::vector<std::pair<StratumClient*, uint32_t>> m_clients;
+
+		uint32_t m_extraNonceStart = 0;
+
 		size_t m_blobSize = 0;
 		uint64_t m_target = 0;
 		uint32_t m_numClientsExpected = 0;
 		uint32_t m_templateId = 0;
 		uint64_t m_height = 0;
+
+		uint32_t m_numClientsProcessed = 0;
+		uint32_t m_numSent = 0;
+
+#ifndef P2POOL_LOG_DISABLE
+		uint32_t m_numBatches = 0;
+#endif
+
 		hash m_seedHash;
 	};
 
@@ -152,9 +164,10 @@ private:
 	static void on_reset_share_counters(uv_async_t* handle) { reinterpret_cast<StratumServer*>(handle->data)->on_reset_share_counters(); }
 	void on_reset_share_counters();
 
-	uv_mutex_t m_blobsQueueLock;
+	uv_mutex_t m_blobsToSendLock;
 	uv_async_t m_blobsAsync;
-	std::vector<BlobsData*> m_blobsQueue;
+	std::unique_ptr<BlobsData> m_blobsToSend;
+	std::unique_ptr<BlobsData> m_blobsBeingSent;
 
 	static void on_blobs_ready(uv_async_t* handle) { reinterpret_cast<StratumServer*>(handle->data)->on_blobs_ready(); }
 	void on_blobs_ready();
@@ -254,6 +267,7 @@ private:
 			LOW_DIFF,
 			INVALID_POW,
 			BANNED,
+			SUBMIT_FAILED,
 			OK
 		} m_result = Result::NONE;
 	};
@@ -333,6 +347,10 @@ private:
 	std::atomic<uint64_t> m_apiLastUpdateTime;
 
 	std::deque<SubmittedShare*> m_pendingShareChecks;
+	bool m_shareCheckInFlight;
+
+	alignas(8) char m_jsonParseValueBuf[STRATUM_BUF_SIZE * 16];
+	alignas(8) char m_jsonParseStackBuf[STRATUM_BUF_SIZE * 16];
 
 	void update_hashrate_data(uint64_t hashes, uint64_t timestamp);
 	void api_update_local_stats(uint64_t timestamp);

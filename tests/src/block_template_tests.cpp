@@ -157,7 +157,7 @@ TEST(block_template, update)
 	tpl.update(data, mempool, params);
 	ASSERT_EQ(tpl.get_reward(), 600300000000ULL);
 
-	ASSERT_EQ(b->m_sidechainId, H("c32abac2cad40e263a94f5f43f90e0a7d7d4b151305b79951dbc8c88c3180613"));
+	ASSERT_EQ(b->m_sidechainId, H("9317e0557a0ba99eac25bb5f4c43b7bbc0b0176d0c777adfac6486bfc46072e5"));
 	ASSERT_EQ(b->m_transactions.size(), 11);
 
 	tpl.get_hashing_blobs(0, 1000, blobs, height, diff, aux_diff, sidechain_diff, seed_hash, nonce_offset, template_id);
@@ -170,7 +170,7 @@ TEST(block_template, update)
 	ASSERT_EQ(template_id, 3U);
 
 	keccak(blobs.data(), static_cast<int>(blobs.size()), blobs_hash.h);
-	ASSERT_EQ(blobs_hash, H("536c0ee8013718b174b63613939379939cee2267e803f77cdabb05fcb47e846f"));
+	ASSERT_EQ(blobs_hash, H("af2b1d6547ba91fe9cf38a6cc0cf5a8a8de1badfbf62846287865e4db3e0bb58"));
 
 	// Test 4: mempool with a lot of transactions with various fees, all parts of transaction picking algorithm should be tested
 
@@ -284,6 +284,55 @@ TEST(block_template, submit_sidechain_block)
 	ASSERT_EQ(tip->m_sidechainHeight, sidechain.chain_window_size() * 3 - 1);
 
 	ASSERT_EQ(tip->m_sidechainId, H("12d57571a28d62d2b6dca3a647500d23ac22864138b22a133f237b459a0862da"));
+	}
+	destroy_crypto_cache();
+
+#ifdef WITH_INDEXED_HASHES
+	indexed_hash::cleanup_storage();
+#endif
+}
+
+TEST(block_template, genesis_block_max_timestamp)
+{
+	init_crypto_cache();
+	{
+	SideChain sidechain(nullptr, NetworkType::Mainnet, "unit_test");
+	ASSERT_EQ(sidechain.consensus_hash(), H("81d45b62c10afa4fdda7cebb02dd5ad82c43b577eb3fb0857824427c55fd8a8d"));
+
+	BlockTemplate tpl(&sidechain, nullptr);
+	tpl.rng().seed(0);
+
+	MinerData data;
+	data.major_version = 16;
+	data.height = 2762973;
+	data.prev_id = H("81a0260b29d5224e88d04b11faff321fbdc11c4570779386b2a1817a86dc622c");
+	data.seed_hash = H("33d0fb381466f04d6a1919ced3b698f54a28add3da5a6479b096c67df7a4974c");
+	data.difficulty = { 300346053753ULL, 0 };
+	data.median_weight = 300000;
+	data.already_generated_coins = 18204981557254756780ULL;
+	data.median_timestamp = std::numeric_limits<uint64_t>::max() - 1;
+
+	Mempool mempool;
+	Params params;
+
+	params.m_miningWallet = Wallet("44MnN1f3Eto8DZYUWuE5XZNUtE3vcRzt2j6PzqWpPau34e6Cf4fAxt6X2MBmrm6F9YMEiMNjN6W4Shn4pLcfNAja621jwyg");
+
+	tpl.update(data, mempool, params);
+
+	ASSERT_TRUE(tpl.submit_sidechain_block(1, 0, 0));
+	ASSERT_EQ(sidechain.difficulty(), 100000);
+
+	const PoolBlock* tip = sidechain.chainTip();
+
+	ASSERT_TRUE(tip != nullptr);
+	ASSERT_TRUE(tip->m_verified);
+	ASSERT_FALSE(tip->m_invalid);
+
+	ASSERT_EQ(tip->m_timestamp, std::numeric_limits<uint64_t>::max());
+	ASSERT_EQ(tip->m_txinGenHeight, data.height);
+	ASSERT_EQ(tip->m_sidechainHeight, 0);
+
+	ASSERT_EQ(tip->m_sidechainId, H("cd83d28671cfdad7e86b07debc45737e4bec40e4555023634a9921d7687e504e"));
 	}
 	destroy_crypto_cache();
 

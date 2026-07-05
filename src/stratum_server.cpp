@@ -23,6 +23,7 @@
 #include "params.h"
 #include "p2pool_api.h"
 #include "p2p_server.h"
+#include "pow_hash.h"
 
 #include "rapidjson_wrapper.h"
 
@@ -63,6 +64,9 @@ StratumServer::StratumServer(p2pool* pool)
 	, m_lastSidechainShareFoundTime(0)
 	, m_totalStratumShares(0)
 	, m_apiLastUpdateTime(0)
+	, m_shareCheckInFlight(false)
+	, m_jsonParseValueBuf{}
+	, m_jsonParseStackBuf{}
 {
 	// Need a bigger buffer for the TLS handshake
 	m_callbackBuf.resize(STRATUM_CALLBACK_BUF_SIZE);
@@ -73,7 +77,7 @@ StratumServer::StratumServer(p2pool* pool)
 	m_hashrateData[0] = { seconds_since_epoch(), 0 };
 
 	uv_mutex_init_checked(&m_resetShareCountersLock);
-	uv_mutex_init_checked(&m_blobsQueueLock);
+	uv_mutex_init_checked(&m_blobsToSendLock);
 	uv_mutex_init_checked(&m_showWorkersLock);
 	uv_mutex_init_checked(&m_rngLock);
 	uv_rwlock_init_checked(&m_hashrateDataLock);
@@ -87,7 +91,6 @@ StratumServer::StratumServer(p2pool* pool)
 
 	uv_async_init_checked(&m_loop, &m_blobsAsync, on_blobs_ready);
 	m_blobsAsync.data = this;
-	m_blobsQueue.reserve(2);
 
 	uv_async_init_checked(&m_loop, &m_showWorkersAsync, on_show_workers);
 	m_showWorkersAsync.data = this;
@@ -103,14 +106,6 @@ StratumServer::~StratumServer()
 	shutdown_tcp();
 
 	{
-		MutexLock lock(m_blobsQueueLock);
-
-		for (BlobsData* data : m_blobsQueue) {
-			delete data;
-		}
-	}
-
-	{
 		WriteLock lock(m_walletTemplatesLock);
 		for (auto& kv : m_walletTemplates) {
 			delete kv.second.tpl;
@@ -120,7 +115,7 @@ StratumServer::~StratumServer()
 	}
 
 	uv_mutex_destroy(&m_resetShareCountersLock);
-	uv_mutex_destroy(&m_blobsQueueLock);
+	uv_mutex_destroy(&m_blobsToSendLock);
 	uv_mutex_destroy(&m_showWorkersLock);
 	uv_mutex_destroy(&m_rngLock);
 	uv_rwlock_destroy(&m_hashrateDataLock);
@@ -256,7 +251,7 @@ void StratumServer::on_block(const BlockTemplate& block)
 	const uint32_t extra_nonce_start = get_random32();
 	m_extraNonce.exchange(extra_nonce_start + num_connections);
 
-	BlobsData* blobs_data = new BlobsData{};
+	std::unique_ptr<BlobsData> blobs_data(new BlobsData{});
 	blobs_data->m_extraNonceStart = extra_nonce_start;
 
 	difficulty_type difficulty;
@@ -268,18 +263,18 @@ void StratumServer::on_block(const BlockTemplate& block)
 	// Even if they do, they'll be added to the beginning of the list and will get their block template in on_login()
 	// We'll iterate through the list backwards so when we get to the beginning and run out of extra_nonce values, it'll be only new clients left
 	blobs_data->m_numClientsExpected = num_connections;
-	blobs_data->m_blobSize = block.get_hashing_blobs(extra_nonce_start, num_connections, blobs_data->m_blobs, blobs_data->m_height, difficulty, aux_diff, sidechain_difficulty, blobs_data->m_seedHash, nonce_offset, blobs_data->m_templateId);
+
+	const uint32_t blobSize = block.get_hashing_blobs(extra_nonce_start, num_connections, blobs_data->m_blobs, blobs_data->m_height, difficulty, aux_diff, sidechain_difficulty, blobs_data->m_seedHash, nonce_offset, blobs_data->m_templateId);
+	blobs_data->m_blobSize = blobSize;
 
 	// Integrity checks
-	if ((blobs_data->m_blobSize < HASHING_BLOB_MIN_SIZE) || (blobs_data->m_blobSize > HASHING_BLOB_MAX_SIZE)) {
-		LOGERR(1, "internal error: get_hashing_blobs returned wrong sized blobs (" << blobs_data->m_blobSize << " bytes)");
-		delete blobs_data;
+	if ((blobSize < HASHING_BLOB_MIN_SIZE) || (blobSize > HASHING_BLOB_MAX_SIZE)) {
+		LOGERR(1, "internal error: get_hashing_blobs returned wrong sized blobs (" << blobSize << " bytes)");
 		return;
 	}
 
 	if (blobs_data->m_blobs.size() != blobs_data->m_blobSize * num_connections) {
 		LOGERR(1, "internal error: get_hashing_blobs returned wrong amount of data");
-		delete blobs_data;
 		return;
 	}
 
@@ -301,7 +296,6 @@ void StratumServer::on_block(const BlockTemplate& block)
 		for (uint32_t i = 1; i < num_connections; ++i) {
 			if (blob_hashes[i - 1] == blob_hashes[i]) {
 				LOGERR(1, "internal error: get_hashing_blobs returned two identical blobs");
-				delete blobs_data;
 				return;
 			}
 		}
@@ -313,21 +307,18 @@ void StratumServer::on_block(const BlockTemplate& block)
 	blobs_data->m_target = std::min(blobs_data->m_target, MAX_TARGET);
 
 	{
-		MutexLock lock(m_blobsQueueLock);
+		MutexLock lock(m_blobsToSendLock);
 
 		if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&m_blobsAsync))) {
-			delete blobs_data;
 			return;
 		}
 
-		m_blobsQueue.push_back(blobs_data);
+		m_blobsToSend = std::move(blobs_data);
 
 		const int err = uv_async_send(&m_blobsAsync);
 		if (err) {
 			LOGERR(1, "uv_async_send failed, error " << uv_err_name(err));
-
-			m_blobsQueue.pop_back();
-			delete blobs_data;
+			m_blobsToSend.reset();
 		}
 	}
 
@@ -709,17 +700,19 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 		}
 
 		// Else switch to a worker thread to check PoW which can take a long time
+
+		// This pointer can either be "in flight" (libuv queue then owns it),
+		// or it can be stored in m_pendingShareChecks - but never in both places
 		SubmittedShare* share2 = new SubmittedShare(share);
 
 		share2->m_req.data = share2;
 		share2->m_allocated = true;
 
-		m_pendingShareChecks.push_back(share2);
-		LOGINFO(5, "on_submit: pending share checks count = " << m_pendingShareChecks.size());
-
-		// If there were no pending share checks, run on_share_found in background
+		// If there is no share check in flight, run on_share_found in background
 		// on_after_share_found will pick the remaining share checks
-		if (m_pendingShareChecks.size() == 1) {
+		if (!m_shareCheckInFlight) {
+			m_shareCheckInFlight = true;
+
 			const int err = uv_queue_work(&m_loop, &share2->m_req, on_share_found, on_after_share_found);
 			if (err) {
 				LOGERR(1, "uv_queue_work failed, error " << uv_err_name(err));
@@ -728,6 +721,10 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 				on_share_found(&share2->m_req);
 				on_after_share_found(&share2->m_req, 0);
 			}
+		}
+		else {
+			m_pendingShareChecks.push_back(share2);
+			LOGINFO(5, "on_submit: pending share checks count = " << m_pendingShareChecks.size());
 		}
 
 		return true;
@@ -1008,37 +1005,71 @@ void StratumServer::on_blobs_ready()
 {
 	check_event_loop_thread(__func__);
 
-	std::vector<BlobsData*> blobs_queue;
-	blobs_queue.reserve(2);
+	const uint64_t cur_time_mcs = microseconds_since_epoch();
+	const uint64_t cur_time = cur_time_mcs / 1'000'000;
 
-	{
-		MutexLock lock(m_blobsQueueLock);
-		blobs_queue = m_blobsQueue;
-		m_blobsQueue.clear();
+	// Get new blobs if we're not sending anything right now
+	std::unique_ptr<BlobsData>& data = m_blobsBeingSent;
+
+	if (!data) {
+		MutexLock lock(m_blobsToSendLock);
+
+		data = std::move(m_blobsToSend);
+
+		if (!data) {
+			return;
+		}
 	}
 
-	if (blobs_queue.empty()) {
-		return;
+	// Take a snapshot of all clients if we just started sending
+	std::vector<std::pair<StratumClient*, uint32_t>>& clients = data->m_clients;
+
+	if (clients.empty()) {
+		const uint32_t N = num_connections();
+		LOGINFO(5, "sending new job to " << N << " clients");
+		clients.reserve(N);
+
+		for (StratumClient* client = static_cast<StratumClient*>(m_connectedClientsList->m_next); client != m_connectedClientsList; client = static_cast<StratumClient*>(client->m_next)) {
+			clients.emplace_back(client, client->m_resetCounter.load());
+		}
 	}
 
-	ON_SCOPE_LEAVE([&blobs_queue]()
-		{
-			for (BlobsData* data : blobs_queue) {
-				delete data;
+#ifndef P2POOL_LOG_DISABLE
+	if (!clients.empty()) {
+		++data->m_numBatches;
+	}
+#endif
+
+	// Per-miner-wallet: each client's blob is derived from its own wallet template
+	// below (template_for()), so the pre-generated shared batch (data->m_blobs) is
+	// not used here. We keep upstream's batched / wall-time-yield loop structure.
+	uint32_t next_wall_time_check = data->m_numClientsProcessed + 10;
+
+	while (!clients.empty()) {
+		// Stop after 0.95 ms total run time, continue in the next libuv loop iteration
+		if (data->m_numClientsProcessed >= next_wall_time_check) {
+			if (microseconds_since_epoch() >= cur_time_mcs + 950) {
+				const int err = uv_async_send(&m_blobsAsync);
+				if (err) {
+					LOGERR(1, "uv_async_send failed, error " << uv_err_name(err));
+				}
+				else {
+					// All good, we'll continue soon
+					return;
+				}
 			}
-		});
+			next_wall_time_check = data->m_numClientsProcessed + 10;
+		}
 
-	// Legacy pre-generated blobs from on_block are unused now — each client below
-	// derives its own blob from its per-miner-wallet template. The BlobsData queue
-	// is still drained (and freed by ON_SCOPE_LEAVE) purely as an async wake-up.
+		StratumClient* client = clients.back().first;
+		const uint32_t expected_reset_counter = clients.back().second;
+		clients.pop_back();
 
-	size_t numClientsProcessed = 0;
-	uint32_t num_sent = 0;
+		++data->m_numClientsProcessed;
 
-	const uint64_t cur_time = seconds_since_epoch();
-
-	for (StratumClient* client = static_cast<StratumClient*>(m_connectedClientsList->m_prev); client != m_connectedClientsList; client = static_cast<StratumClient*>(client->m_prev)) {
-		++numClientsProcessed;
+		if (client->is_gone(expected_reset_counter)) {
+			continue;
+		}
 
 		if (!client->m_rpcId) {
 			// Not logged in yet, on_login() will send the job to this client. Also close inactive connections.
@@ -1050,7 +1081,7 @@ void StratumServer::on_blobs_ready()
 			continue;
 		}
 
-		// Find the right BlockTemplate for this client's wallet
+		// Find the right BlockTemplate for this client's wallet (per-miner-wallet payouts)
 		BlockTemplate* tpl = template_for(client->m_minerWallet);
 		if (!tpl) {
 			tpl = &m_pool->block_template();
@@ -1058,7 +1089,7 @@ void StratumServer::on_blobs_ready()
 
 		const uint32_t extra_nonce = m_extraNonce.fetch_add(1);
 
-		uint8_t hashing_blob[128];
+		uint8_t hashing_blob[HASHING_BLOB_MAX_SIZE];
 		uint64_t height, sidechain_height;
 		difficulty_type difficulty, aux_diff, sidechain_difficulty;
 		hash seed_hash;
@@ -1132,19 +1163,35 @@ void StratumServer::on_blobs_ready()
 			});
 
 		if (result) {
-			++num_sent;
+			++data->m_numSent;
 		}
 		else {
 			client->close();
 		}
 	}
 
-	const uint32_t num_connections = m_numConnections;
-	if (numClientsProcessed != num_connections) {
-		LOGWARN(1, "client list is broken, expected " << num_connections << ", got " << numClientsProcessed << " clients");
-	}
+#ifndef P2POOL_LOG_DISABLE
+	const uint32_t numClientsProcessed = data->m_numClientsProcessed;
+	const uint32_t numSent = data->m_numSent;
+	const uint32_t numBatches = data->m_numBatches;
 
-	LOGINFO(3, "sent new job to " << num_sent << '/' << numClientsProcessed << " clients");
+	LOGINFO(3, "sent new job to " << numSent << '/' << numClientsProcessed << " clients in " << numBatches << " batches");
+#endif
+
+	// Get the next job to send, if any
+	// We could call on_blobs_ready() recursively here,
+	// and it would've been faster, but it's prone to unlimited recursion
+
+	MutexLock lock(m_blobsToSendLock);
+
+	data = std::move(m_blobsToSend);
+
+	if (data) {
+		const int err = uv_async_send(&m_blobsAsync);
+		if (err) {
+			LOGERR(1, "uv_async_send failed, error " << uv_err_name(err));
+		}
+	}
 }
 
 void StratumServer::update_hashrate_data(uint64_t hashes, uint64_t timestamp)
@@ -1221,6 +1268,8 @@ void StratumServer::on_share_found(uv_work_t* req)
 	const uint64_t target = share->m_target;
 	const uint64_t hashes = share->m_hashes;
 
+	bool submit_failed = false;
+
 	if (share->m_highEnoughDifficulty || server->m_enableFullValidation) {
 		if (pool->stopped()) {
 			LOGWARN(0, "p2pool is shutting down, but a share was found. Trying to process it anyway!");
@@ -1247,7 +1296,7 @@ void StratumServer::on_share_found(uv_work_t* req)
 		}
 
 		hash pow_hash;
-		if (!pool->calculate_hash(blob, blob_size, height, seed_hash, pow_hash, false)) {
+		if (!pool->calculate_hash(blob, blob_size, height, seed_hash, pow_hash, false, RandomX_Hasher_Base::VM_LANE_STRATUM)) {
 			LOGWARN(3, "client " << static_cast<char*>(share->m_clientAddrString) << " couldn't check share PoW");
 			share->m_result = SubmittedShare::Result::COULDNT_CHECK_POW;
 			return;
@@ -1258,13 +1307,21 @@ void StratumServer::on_share_found(uv_work_t* req)
 
 			// Calculate the same hash second time to check if it's an unstable hardware that caused this
 			hash pow_hash2;
-			if (pool->calculate_hash(blob, blob_size, height, seed_hash, pow_hash2, true) && (pow_hash2 != pow_hash)) {
+			if (pool->calculate_hash(blob, blob_size, height, seed_hash, pow_hash2, true, RandomX_Hasher_Base::VM_LANE_STRATUM) && (pow_hash2 != pow_hash)) {
 				LOGERR(0, "UNSTABLE HARDWARE DETECTED: Calculated the same hash twice, got different results: " << pow_hash << " != " << pow_hash2);
 
 				if (pow_hash2 == share->m_resultHash) {
 					invalid_pow = false;
 				}
 			}
+
+#ifdef DEV_TEST_SYNC
+			static std::atomic<uint32_t> pow_was_forced = 0;
+
+			if (pow_was_forced.exchange(1) == 0) {
+				invalid_pow = false;
+			}
+#endif
 
 			if (invalid_pow) {
 				LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " submitted a share with invalid PoW");
@@ -1280,12 +1337,15 @@ void StratumServer::on_share_found(uv_work_t* req)
 		if (share->m_highEnoughDifficulty) {
 			const double diff = sidechain_difficulty.to_double();
 			time_t prev_time;
+			uint64_t prevCumulativeHashesAtLastShare;
 			const time_t cur_time = time(nullptr);
 			{
 				WriteLock lock(server->m_hashrateDataLock);
 
 				const uint64_t n = server->m_cumulativeHashes + hashes;
 				share->m_effort = static_cast<double>(n - server->m_cumulativeHashesAtLastShare) * 100.0 / diff;
+
+				prevCumulativeHashesAtLastShare = server->m_cumulativeHashesAtLastShare;
 				server->m_cumulativeHashesAtLastShare = n;
 
 				server->m_cumulativeFoundSharesDiff += diff;
@@ -1296,7 +1356,12 @@ void StratumServer::on_share_found(uv_work_t* req)
 			}
 
 			if (!share->m_tpl->submit_sidechain_block(share->m_templateId, share->m_nonce, share->m_extraNonce)) {
+				submit_failed = true;
+
 				WriteLock lock(server->m_hashrateDataLock);
+
+				server->m_cumulativeHashesAtLastShare = prevCumulativeHashesAtLastShare;
+				server->m_cumulativeFoundSharesDiff -= diff;
 
 				if (server->m_totalFoundSidechainShares > 0) {
 					--server->m_totalFoundSidechainShares;
@@ -1314,7 +1379,7 @@ void StratumServer::on_share_found(uv_work_t* req)
 		const uint64_t timestamp = share->m_timestamp;
 		server->update_hashrate_data(hashes, timestamp);
 		server->api_update_local_stats(timestamp);
-		share->m_result = SubmittedShare::Result::OK;
+		share->m_result = submit_failed ? SubmittedShare::Result::SUBMIT_FAILED : SubmittedShare::Result::OK;
 	}
 	else {
 		LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " got a low diff share");
@@ -1348,6 +1413,7 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 				"low difficulty",
 				"invalid PoW",
 				"worker banned",
+				"submit failed"
 			};
 			static_assert(array_size(reason_list) == static_cast<size_t>(SubmittedShare::Result::OK), "Update reason_list to match SubmittedShare::Result enum");
 
@@ -1375,7 +1441,7 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 
 	StratumClient* client = share->m_client;
 
-	if (client->m_resetCounter.load() == share->m_clientResetCounter) {
+	if (!client->is_gone(share->m_clientResetCounter)) {
 		const bool result = server->send(client,
 			[share](uint8_t* buf, size_t buf_size)
 			{
@@ -1398,6 +1464,9 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 					break;
 				case SubmittedShare::Result::BANNED:
 					s << "{\"id\":" << share->m_id << ",\"jsonrpc\":\"2.0\",\"error\":{\"message\":\"Banned\"}}\n";
+					break;
+				case SubmittedShare::Result::SUBMIT_FAILED:
+					s << "{\"id\":" << share->m_id << ",\"jsonrpc\":\"2.0\",\"error\":{\"message\":\"Submit failed\"}}\n";
 					break;
 				case SubmittedShare::Result::OK:
 					s << "{\"id\":" << share->m_id << ",\"jsonrpc\":\"2.0\",\"error\":null,\"result\":{\"status\":\"OK\"}}\n";
@@ -1425,15 +1494,15 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 	}
 
 	if (share->m_allocated) {
-		auto it = std::find(server->m_pendingShareChecks.begin(), server->m_pendingShareChecks.end(), share);
-		if (it != server->m_pendingShareChecks.end()) {
-			server->m_pendingShareChecks.erase(it);
-		}
-
 		delete share;
 
-		if (!server->m_pendingShareChecks.empty()) {
+		if (server->m_pendingShareChecks.empty()) {
+			server->m_shareCheckInFlight = false;
+		}
+		else {
 			SubmittedShare* share2 = server->m_pendingShareChecks.front();
+			server->m_pendingShareChecks.pop_front();
+			LOGINFO(5, "on_after_share_found: pending share checks count = " << server->m_pendingShareChecks.size());
 
 			const int err = uv_queue_work(&server->m_loop, &share2->m_req, on_share_found, on_after_share_found);
 			if (err) {
@@ -1445,20 +1514,23 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 			}
 		}
 
-		LOGINFO(5, "on_after_share_found: pending share checks count = " << server->m_pendingShareChecks.size());
-
 		BACKGROUND_JOB_STOP(StratumServer::on_share_found);
 	}
 }
 
 void StratumServer::on_shutdown()
 {
+	for (const SubmittedShare* share : m_pendingShareChecks) {
+		delete share;
+	}
+	m_pendingShareChecks.clear();
+
 	{
 		MutexLock lock(m_resetShareCountersLock);
 		uv_close(reinterpret_cast<uv_handle_t*>(&m_resetShareCountersAsync), nullptr);
 	}
 	{
-		MutexLock lock(m_blobsQueueLock);
+		MutexLock lock(m_blobsToSendLock);
 		uv_close(reinterpret_cast<uv_handle_t*>(&m_blobsAsync), nullptr);
 	}
 	{
@@ -1618,10 +1690,19 @@ bool StratumServer::StratumClient::on_read(const char* data, uint32_t size)
 	return on_parse(data, size);
 }
 
-bool StratumServer::StratumClient::process_request(char* data, uint32_t size)
+bool StratumServer::StratumClient::process_request(char* data, uint32_t /*size*/)
 {
-	rapidjson::Document doc;
-	if (doc.Parse(data, size).HasParseError()) {
+	StratumServer* server = static_cast<StratumServer*>(m_owner);
+
+	using namespace rapidjson;
+
+	MemoryPoolAllocator<> valueAlloc(server->m_jsonParseValueBuf, sizeof(server->m_jsonParseValueBuf));
+	MemoryPoolAllocator<> stackAlloc(server->m_jsonParseStackBuf, sizeof(server->m_jsonParseStackBuf));
+
+	// "/ 2" on the second parameter because it's an initial reservation, not the full stack buf size
+	GenericDocument<UTF8<>, MemoryPoolAllocator<>, MemoryPoolAllocator<>> doc(&valueAlloc, sizeof(server->m_jsonParseStackBuf) / 2, &stackAlloc);
+
+	if (doc.ParseInsitu(data).HasParseError()) {
 		LOGWARN(4, "client " << static_cast<char*>(m_addrString) << " invalid JSON request (parse error)");
 		return false;
 	}

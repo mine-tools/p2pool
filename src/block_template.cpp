@@ -28,6 +28,7 @@
 #include "side_chain.h"
 #include "pool_block.h"
 #include "merkle.h"
+#include "pow_hash.h"
 #include <zmq.hpp>
 #include <ctime>
 #include <numeric>
@@ -717,7 +718,7 @@ void BlockTemplate::update(const MinerData& data, const Mempool& mempool, const 
 			}
 		}
 		PoolBlock check;
-		const int result = check.deserialize(m_fullDataBlob.data(), m_fullDataBlob.size(), *m_sidechain, nullptr, false);
+		const int result = check.deserialize(m_fullDataBlob.data(), m_fullDataBlob.size(), *m_sidechain, nullptr, false, false);
 		if (result != 0) {
 			LOGERR(1, "pool block blob generation and/or parsing is broken, error " << result);
 		}
@@ -1041,6 +1042,7 @@ hash BlockTemplate::calc_sidechain_hash(uint32_t sidechain_extra_nonce) const
 		keccak_custom([this, sidechain_extra_nonce_offset, &sidechain_extra_nonce_buf](int offset) -> uint8_t {
 			const uint32_t k = static_cast<uint32_t>(offset - sidechain_extra_nonce_offset);
 			if (k < EXTRA_NONCE_SIZE) {
+				// cppcheck-suppress objectIndex
 				return sidechain_extra_nonce_buf[k];
 			}
 			return m_sidechainHashBlob[offset];
@@ -1109,6 +1111,7 @@ hash BlockTemplate::calc_miner_tx_hash(uint32_t extra_nonce) const
 		keccak_custom([data, extra_nonce_offset, &extra_nonce_buf, merkle_root_offset, &merge_mining_root](int offset) {
 			uint32_t k = static_cast<uint32_t>(offset - static_cast<int>(extra_nonce_offset));
 			if (k < EXTRA_NONCE_SIZE) {
+				// cppcheck-suppress objectIndex
 				return extra_nonce_buf[k];
 			}
 
@@ -1488,14 +1491,14 @@ bool BlockTemplate::submit_sidechain_block(uint32_t template_id, uint32_t nonce,
 			buf.insert(buf.end(), sidechain_data.begin(), sidechain_data.end());
 
 			PoolBlock check;
-			const int result = check.deserialize(buf.data(), buf.size(), *m_sidechain, nullptr, false);
+			const int result = check.deserialize(buf.data(), buf.size(), *m_sidechain, nullptr, false, false);
 			if (result != 0) {
 				LOGERR(1, "pool block blob generation and/or parsing is broken, error " << result);
 			}
 
 			if (m_hasher) {
 				hash pow_hash;
-				if (!check.get_pow_hash(m_hasher, check.m_txinGenHeight, m_seedHash, pow_hash)) {
+				if (!check.get_pow_hash(m_hasher, check.m_txinGenHeight, m_seedHash, pow_hash, false, RandomX_Hasher_Base::VM_LANE_STRATUM)) {
 					LOGERR(1, "PoW check failed for the sidechain block. Fix it! ");
 				}
 				else if (!check.m_difficulty.check_pow(pow_hash)) {

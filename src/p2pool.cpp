@@ -72,11 +72,6 @@ p2pool::p2pool(const Params& params)
 {
 	LOGINFO(1, log::LightCyan() << VERSION);
 
-	// P2Pool-nano requires more Monero blocks for the initial sync
-	if (m_params.m_nano) {
-		BLOCK_HEADERS_REQUIRED = 1440;
-	}
-
 	bkg_jobs_tracker = new BackgroundJobTracker();
 
 #ifdef WITH_UPNP
@@ -197,6 +192,9 @@ p2pool::p2pool(const Params& params)
 
 	m_sideChain = new SideChain(this, type, m_params.m_mini ? "mini" : (m_params.m_nano ? "nano" : nullptr));
 
+	// Update it for non-standard sidechain configs (including P2Pool-nano)
+	BLOCK_HEADERS_REQUIRED = std::max(BLOCK_HEADERS_REQUIRED, m_sideChain->monero_headers_required());
+
 #ifdef WITH_RANDOMX
 	if (m_params.m_disableRandomX) {
 		m_hasher = new RandomX_Hasher_RPC(this);
@@ -293,7 +291,7 @@ void p2pool::update_host_ping(const std::string& display_name, double ping)
 		LOGINFO(1, display_name << " ping is " << ping << " ms");
 	}
 	else {
-		LOGWARN(1, display_name << " ping is " << ping << " ms, this is too high for an efficient mining. Try to use a different node, or your own local node.");
+		LOGWARN(1, display_name << " ping is " << ping << " ms, this is too high for efficient mining. Try to use a different node, or your own local node.");
 	}
 
 	const std::vector<Params::Host>& v = m_params.m_hosts;
@@ -328,9 +326,9 @@ void p2pool::print_hosts() const
 	}
 }
 
-bool p2pool::calculate_hash(const void* data, size_t size, uint64_t height, const hash& seed, hash& result, bool force_light_mode)
+bool p2pool::calculate_hash(const void* data, size_t size, uint64_t height, const hash& seed, hash& result, bool force_light_mode, size_t lane)
 {
-	return m_hasher->calculate(data, size, height, seed, result, force_light_mode);
+	return m_hasher->calculate(data, size, height, seed, result, force_light_mode, lane);
 }
 
 uint64_t p2pool::get_seed_height(uint64_t height)
@@ -489,11 +487,16 @@ void p2pool::handle_miner_data(MinerData& data)
 				check_height(h);
 			}
 
-			const uint64_t seed_height = get_seed_height(data.height);
-			const uint64_t prev_seed_height = (seed_height > SEEDHASH_EPOCH_BLOCKS) ? (seed_height - SEEDHASH_EPOCH_BLOCKS) : 0;
+			uint64_t seed_height = get_seed_height(data.height);
+			const uint64_t oldest_seed_height = (data.height > BLOCK_HEADERS_REQUIRED) ? get_seed_height(data.height - BLOCK_HEADERS_REQUIRED) : 0;
 
-			check_height(seed_height);
-			check_height(prev_seed_height);
+			for (;;) {
+				check_height(seed_height);
+				if (seed_height <= std::max(oldest_seed_height, SEEDHASH_EPOCH_BLOCKS - 1)) {
+					break;
+				}
+				seed_height -= SEEDHASH_EPOCH_BLOCKS;
+			}
 		}
 
 		if (missing_heights.size() > 1) {
@@ -971,12 +974,12 @@ void p2pool::submit_aux_block() const
 
 		if ((hashing_blob_size < HASHING_BLOB_MIN_SIZE) || (hashing_blob_size > HASHING_BLOB_MAX_SIZE)) {
 			LOGWARN(3, "submit_aux_block: invalid hashing_blob_size (" << hashing_blob_size << " bytes)");
-			return;
+			continue;
 		}
 
 		if (blob.empty()) {
 			LOGWARN(3, "submit_aux_block: block template blob not found");
-			return;
+			continue;
 		}
 
 		uint8_t* p = blob.data();
@@ -1168,7 +1171,7 @@ void p2pool::submit_block() const
 				auto& err = doc["error"];
 
 				if (!err.IsObject()) {
-					LOGERR(0, "submit_block: invalid JSON reponse from daemon: 'error' is not an object");
+					LOGERR(0, "submit_block: invalid JSON response from daemon: 'error' is not an object");
 					return;
 				}
 
@@ -1311,7 +1314,7 @@ void p2pool::download_block_headers2(uint64_t current_height)
 		[this, seed_height, current_height](const JSONRPCRequest::CallbackData& data) {
 			ChainMain block;
 			if (parse_block_header(data.m_response.data(), data.m_response.size(), block)) {
-				const uint64_t start_height = (current_height > BLOCK_HEADERS_REQUIRED) ? (current_height - BLOCK_HEADERS_REQUIRED) : 0;
+				const uint64_t start_height = get_seed_height((current_height > BLOCK_HEADERS_REQUIRED) ? (current_height - BLOCK_HEADERS_REQUIRED) : 0);
 				download_block_headers3(start_height, current_height);
 			}
 			else {
@@ -2075,11 +2078,23 @@ void p2pool::api_update_stats_mod()
 void p2pool::cleanup_mainchain_data(uint64_t height)
 {
 	// Expects m_mainchainLock to be already locked here
-	// Deletes everything older than 720 blocks, except for the 3 latest RandomX seed heights
+	// Deletes everything older than 720 blocks, except for the 3-4 latest RandomX seed heights
 
 	const uint64_t PRUNE_DISTANCE = BLOCK_HEADERS_REQUIRED;
-	const uint64_t seed_height = get_seed_height(height);
-	const std::array<uint64_t, 3> seed_heights{ seed_height, seed_height - SEEDHASH_EPOCH_BLOCKS, seed_height - SEEDHASH_EPOCH_BLOCKS * 2 };
+
+	uint64_t seed_height = get_seed_height(height);
+	const uint64_t oldest_seed_height = (height > BLOCK_HEADERS_REQUIRED) ? get_seed_height(height - BLOCK_HEADERS_REQUIRED) : 0;
+
+	std::vector<uint64_t> seed_heights;
+	seed_heights.reserve((seed_height - oldest_seed_height) / SEEDHASH_EPOCH_BLOCKS + 1);
+
+	for (;;) {
+		seed_heights.emplace_back(seed_height);
+		if (seed_height <= std::max(oldest_seed_height, SEEDHASH_EPOCH_BLOCKS - 1)) {
+			break;
+		}
+		seed_height -= SEEDHASH_EPOCH_BLOCKS;
+	}
 
 	for (auto it = m_mainchainByHeight.begin(); it != m_mainchainByHeight.end();) {
 		const uint64_t h = it->first;
