@@ -554,6 +554,10 @@ static thread_local bool main_thread = false;
 void set_main_thread() { main_thread = true; }
 bool is_main_thread() { return main_thread; }
 
+static thread_local bool uv_worker_pool_thread = false;
+void set_uv_worker_pool_thread() { uv_worker_pool_thread = true; }
+bool is_uv_worker_pool_thread() { return uv_worker_pool_thread; }
+
 bool disable_resolve_host = false;
 
 bool resolve_host(std::string& host, bool& is_v6)
@@ -724,7 +728,7 @@ bool str_to_ip(bool is_v6, const char* ip, raw_ip& result)
 		sockaddr_in6* addr6 = reinterpret_cast<sockaddr_in6*>(&addr);
 		const int err = uv_ip6_addr(ip, 0, addr6);
 		if (err) {
-			LOGERR(1, "failed to parse IPv6 address " << ip << ", error " << uv_err_name(err));
+			LOGWARN(1, "failed to parse IPv6 address " << ip << ", error " << uv_err_name(err));
 			return false;
 		}
 		memcpy(result.data, &addr6->sin6_addr, sizeof(in6_addr));
@@ -733,7 +737,7 @@ bool str_to_ip(bool is_v6, const char* ip, raw_ip& result)
 		sockaddr_in* addr4 = reinterpret_cast<sockaddr_in*>(&addr);
 		const int err = uv_ip4_addr(ip, 0, addr4);
 		if (err) {
-			LOGERR(1, "failed to parse IPv4 address " << ip << ", error " << uv_err_name(err));
+			LOGWARN(1, "failed to parse IPv4 address " << ip << ", error " << uv_err_name(err));
 			return false;
 		}
 		memcpy(result.data, raw_ip::ipv4_prefix, sizeof(raw_ip::ipv4_prefix));
@@ -743,7 +747,7 @@ bool str_to_ip(bool is_v6, const char* ip, raw_ip& result)
 	return true;
 }
 
-bool is_localhost(const std::string& host)
+bool is_private_address(const std::string& host)
 {
 	if (host.empty()) {
 		return false;
@@ -753,16 +757,37 @@ bool is_localhost(const std::string& host)
 		return true;
 	}
 
-	if (host.find_first_not_of("0123456789.:") != std::string::npos) {
+	if (host.find_first_not_of("0123456789abcdef.:") != std::string::npos) {
 		return false;
 	}
 
 	raw_ip addr;
-	if (!str_to_ip(host.find(':') != std::string::npos, host.c_str(), addr)) {
+	const bool is_v6 = host.find(':') != std::string::npos;
+
+	if (!str_to_ip(is_v6, host.c_str(), addr)) {
 		return false;
 	}
 
-	return addr.is_localhost();
+	if (is_v6) {
+		const uint8_t a = addr.data[0];
+		const uint8_t b = addr.data[1];
+
+		return
+			(addr == raw_ip::localhost_ipv6) ||    // ::1 (loopback)
+			((a & 0xfe) == 0xfc) ||                // fc00::/7 (ULA - Unique Local Address)
+			((a == 0xfe) && ((b & 0xc0) == 0x80)); // fe80::/10 (link-local)
+	}
+
+	// IPv4
+	const uint8_t a = addr.data[12];
+	const uint8_t b = addr.data[13];
+
+	return 
+		(a == 10) ||                              // 10.0.0.0/8 (Private/LAN)
+		((a == 172) && (b >= 16) && (b <= 31)) || // 172.16.0.0/12 (Private/LAN)
+		((a == 192) && (b == 168)) ||             // 192.168.0.0/16 (Private/LAN)
+		((a == 169) && (b == 254)) ||             // 169.254.0.0/16 (link-local)
+		(a == 127);                               // 127.0.0.0/8 (loopback)
 }
 
 UV_LoopUserData* GetLoopUserData(uv_loop_t* loop, bool create)
@@ -973,13 +998,56 @@ void init_uv()
 	int err = putenv(buf);
 	if (err != 0) {
 		err = errno;
-		fprintf(stderr, "Couldn't set UV thread pool size to %u threads, putenv returned error %d\n", N, err);
+		fprintf(stderr, "init_uv_threadpool: couldn't set UV thread pool size to %u threads, putenv returned error %d\n", N, err);
+		abort();
 	}
 
-	static uv_work_t dummy;
-	err = uv_queue_work(uv_default_loop_checked(), &dummy, [](uv_work_t*) {}, nullptr);
-	if (err) {
-		fprintf(stderr, "init_uv_threadpool: uv_queue_work failed, error %s\n", uv_err_name(err));
+	struct Work {
+		uv_work_t req = {};
+		std::shared_ptr<std::atomic<int32_t>> k = 0;
+
+		FORCEINLINE void run()
+		{
+			k->fetch_sub(1, std::memory_order_acq_rel);
+
+			// Wait until all threads are at this point
+			while (k->load(std::memory_order_acquire) > 0) {
+				cpu_yield();
+			}
+
+			set_uv_worker_pool_thread();
+		}
+	};
+
+	std::shared_ptr<std::atomic<int32_t>> k(new std::atomic<int32_t>(static_cast<int32_t>(N)));
+
+	for (uint32_t i = 0; i < N; ++i) {
+		Work* w = new Work{ {}, k };
+		w->req.data = w;
+
+		err = uv_queue_work(uv_default_loop_checked(), &w->req,
+			[](uv_work_t* req) {
+				reinterpret_cast<Work*>(req->data)->run();
+			},
+			[](uv_work_t* req, int) {
+				delete reinterpret_cast<Work*>(req->data);
+			});
+
+		if (err) {
+			fprintf(stderr, "init_uv_threadpool: uv_queue_work failed, error %s\n", uv_err_name(err));
+			abort();
+		}
+	}
+
+	// Bail out after 1 second
+	const uint64_t start_time = microseconds_since_epoch();
+
+	while (k->load(std::memory_order_acquire) > 0) {
+		if (microseconds_since_epoch() - start_time >= 1'000'000) {
+			fprintf(stderr, "init_uv_threadpool: timed out waiting for %u worker threads\n", N);
+			abort();
+		}
+		cpu_yield();
 	}
 }
 

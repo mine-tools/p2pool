@@ -195,20 +195,8 @@ SideChain::SideChain(p2pool* pool, NetworkType type, const char* pool_name)
 	uv_mutex_init_checked(&m_precalcJobsMutex);
 	m_precalcJobs.reserve(16);
 
-	uint32_t numThreads = std::thread::hardware_concurrency();
-
-	// Leave 1 CPU core free from worker threads
-	if (numThreads > 1) {
-		--numThreads;
-	}
-
-	// Use between 1 and 8 threads
-	if (numThreads < 1) numThreads = 1;
-
-	// Don't limit thread count when debugging because debug builds are slow
-#ifndef P2POOL_DEBUGGING
-	if (numThreads > 8) numThreads = 8;
-#endif
+	// One thread is enough with batched derivations
+	const uint32_t numThreads = 1;
 
 	LOGINFO(4, "running " << numThreads << " pre-calculation workers");
 
@@ -387,6 +375,13 @@ bool SideChain::get_shares(const PoolBlock* tip, std::vector<MinerShare>& shares
 			LOGWARN(L, "get_shares: couldn't get mainchain difficulty for height = " << h);
 			return false;
 		}
+
+		LOGINFO(6, "get_shares: parent = " << tip->m_parent
+			<< ", height = " << tip->m_sidechainHeight
+			<< ", Monero height = " << tip->m_txinGenHeight
+			<< ", seed height = " << h
+			<< ", mainchain_diff = " << mainchain_diff
+		);
 	}
 
 	// Dynamic PPLNS window starting from v2
@@ -476,6 +471,21 @@ bool SideChain::get_shares(const PoolBlock* tip, std::vector<MinerShare>& shares
 	const uint64_t n = shares.size();
 
 	// Shuffle shares
+
+	// TODO: on the next hardfork change the shuffle to a better variant that churns only O(1) indices when wallets enter/leave
+	//
+	// The idea:
+	//
+	// Oldest wallet in the PPLNS window picks its index in [0, N) randomly by
+	// picking a random number in the [0, next_pow2(N + big enough margin)) range to workaround the changing N.
+	//
+	// The deterministic PRNG to be used for this must have uniformly distributed bits for any N consecutive bits it generates.
+	// Maybe PCG64 (permuted congruential generator) seeded with sha256(wallet keys||m_txkeySecSeed) will be good enough.
+	//
+	// The next wallet picks its index also in [0, N) and repeats if it conflicts, and so on.
+	// Tests have shown that each "wallet set change" churns ~5-6 indices, instead of 34-60% with the current algorithm.
+	// Fewer indices changed -> faster get_outputs_blob() because it has to do fewer new eph public key calculations.
+
 	if (n > 1) {
 		hash h;
 		keccak(tip->m_txkeySecSeed.h, HASH_SIZE, h.h);
@@ -490,7 +500,7 @@ bool SideChain::get_shares(const PoolBlock* tip, std::vector<MinerShare>& shares
 		}
 	}
 
-	LOGINFO(6, "get_shares: " << n << " unique wallets in PPLNS window");
+	LOGINFO(6, "get_shares: parent = " << tip->m_parent << ", " << n << " unique wallets in PPLNS window, PPLNS weight = " << pplns_weight);
 	return true;
 }
 
@@ -847,22 +857,12 @@ const PoolBlock* SideChain::get_block_blob(const hash& id, std::vector<uint8_t>&
 	return block;
 }
 
-bool SideChain::get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::vector<uint8_t>& blob, uv_loop_t* loop) const
+bool SideChain::get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::vector<uint8_t>& blob) const
 {
 	blob.clear();
 
-	struct Data
-	{
-		FORCEINLINE Data() : counter(0) {}
-		Data(Data&&) = delete;
-		Data& operator=(Data&&) = delete;
+	hash txkeySec;
 
-		std::vector<Wallet> wallets;
-		hash txkeySec;
-		std::atomic<int> counter;
-	};
-
-	std::shared_ptr<Data> data;
 	std::vector<uint64_t> tmpRewards;
 	std::vector<MinerShare> tmpShares;
 	{
@@ -896,8 +896,7 @@ bool SideChain::get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::v
 			return total_reward_check == total_reward;
 		}
 
-		data = std::make_shared<Data>();
-		data->txkeySec = block->m_txkeySec;
+		txkeySec = block->m_txkeySec;
 
 		if (!get_shares(block, tmpShares) || !split_reward(total_reward, tmpShares, tmpRewards) || (tmpRewards.size() != tmpShares.size())) {
 			return false;
@@ -906,31 +905,45 @@ bool SideChain::get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::v
 
 	const size_t n = tmpShares.size();
 
-	data->wallets.reserve(n);
+	LOGINFO(6, "get_outputs_blob batch start");
 
-	for (const MinerShare& i : tmpShares) {
-		data->wallets.emplace_back(*i.m_wallet);
+	std::vector<std::pair<hash, size_t>> in;
+	std::vector<std::pair<hash, int32_t>> out;
+
+	in.reserve(n);
+	for (size_t i = 0; i < n; ++i) {
+		in.emplace_back(tmpShares[i].m_wallet->view_public_key(), i);
 	}
 
-	data->counter = static_cast<int>(n) - 1;
-
-	// Helper jobs call get_eph_public_key with indices in descending order
-	// Current thread will process indices in ascending order so when they meet, everything will be cached
-	if (loop) {
-		parallel_run(loop, [data]() {
-			Data* d = data.get();
-			hash eph_public_key;
-
-			int index;
-			while ((index = d->counter.fetch_sub(1)) >= 0) {
-				uint8_t view_tag;
-				if (!d->wallets[index].get_eph_public_key(d->txkeySec, static_cast<size_t>(index), eph_public_key, view_tag)) {
-					LOGWARN(6, "get_eph_public_key failed at index " << index);
-					return;
-				}
+	if (!batch_derivations(in, txkeySec, out)) {
+		for (size_t i = 0; i < n; ++i) {
+			if (out[i].second < 0) {
+				LOGWARN(6, "batch_derivations failed at index " << i);
 			}
-		});
+		}
+		return false;
 	}
+
+	LOGINFO(6, "get_outputs_blob batch, stage 2 start");
+
+	std::vector<batch_public_key_input> in2;
+	std::vector<std::pair<hash, bool>> out2;
+
+	in2.reserve(n);
+	for (size_t i = 0; i < n; ++i) {
+		in2.emplace_back(out[i].first, i, tmpShares[i].m_wallet->spend_public_key());
+	}
+
+	if (!batch_public_keys(in2, out2)) {
+		for (size_t i = 0; i < n; ++i) {
+			if (!out2[i].second) {
+				LOGWARN(6, "batch_public_keys failed at index " << i);
+			}
+		}
+		return false;
+	}
+
+	LOGINFO(6, "get_outputs_blob batch end");
 
 	blob.reserve(n * 39 + 64);
 
@@ -942,24 +955,13 @@ bool SideChain::get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::v
 	block->m_ephPublicKeys.reserve(n);
 	block->m_outputAmounts.reserve(n);
 
-	hash eph_public_key;
 	for (size_t i = 0; i < n; ++i) {
-		// stop helper jobs when they meet with current thread
-		const int c = data->counter.load();
-		if ((c >= 0) && (static_cast<int>(i) >= c)) {
-			// this will cause all helper jobs to finish immediately
-			data->counter = -1;
-		}
-
 		writeVarint(tmpRewards[i], blob);
 
-		blob.emplace_back(TXOUT_TO_TAGGED_KEY);
+		const hash& eph_public_key = out2[i].first;
+		const uint8_t view_tag = static_cast<uint8_t>(out[i].second);
 
-		uint8_t view_tag;
-		if (!data->wallets[i].get_eph_public_key(data->txkeySec, i, eph_public_key, view_tag)) {
-			LOGWARN(6, "get_eph_public_key failed at index " << i);
-			return false;
-		}
+		blob.emplace_back(TXOUT_TO_TAGGED_KEY);
 		blob.insert(blob.end(), eph_public_key.h, eph_public_key.h + HASH_SIZE);
 
 		blob.emplace_back(view_tag);
@@ -1309,11 +1311,11 @@ bool SideChain::split_reward(uint64_t reward, const std::vector<MinerShare>& sha
 	return true;
 }
 
-bool SideChain::get_difficulty(const PoolBlock* const tip, std::vector<DifficultyData>& difficultyData, difficulty_type& curDifficulty) const
+int SideChain::get_difficulty(const PoolBlock* const tip, std::vector<DifficultyData>& difficultyData, difficulty_type& curDifficulty) const
 {
 	if (!pool_block_debug() && !tip->m_cachedNextDifficulty.empty()) {
 		curDifficulty = tip->m_cachedNextDifficulty;
-		return true;
+		return 0;
 	}
 
 	difficultyData.clear();
@@ -1331,7 +1333,7 @@ bool SideChain::get_difficulty(const PoolBlock* const tip, std::vector<Difficult
 			if (it == m_blocksById.end()) {
 				LOGWARN(3, "get_difficulty: can't find uncle block at height = " << cur->m_sidechainHeight << ", id = " << uncle_id);
 				LOGWARN(3, "get_difficulty: can't calculate diff for block at height = " << tip->m_sidechainHeight << ", id = " << tip->m_sidechainId << ", mainchain height = " << tip->m_txinGenHeight);
-				return false;
+				return 1;
 			}
 
 			const PoolBlock* uncle = it->second;
@@ -1355,7 +1357,7 @@ bool SideChain::get_difficulty(const PoolBlock* const tip, std::vector<Difficult
 		if (it == m_blocksById.end()) {
 			LOGWARN(3, "get_difficulty: can't find parent block at height = " << cur->m_sidechainHeight - 1 << ", id = " << cur->m_parent);
 			LOGWARN(3, "get_difficulty: can't calculate diff for block at height = " << tip->m_sidechainHeight << ", id = " << tip->m_sidechainId << ", mainchain height = " << tip->m_txinGenHeight);
-			return false;
+			return 1;
 		}
 
 		cur = it->second;
@@ -1372,7 +1374,7 @@ bool SideChain::get_difficulty(const PoolBlock* const tip, std::vector<Difficult
 		if (dt > std::numeric_limits<uint32_t>::max()) {
 			LOGWARN(3, "get_difficulty: too large timestamp delta " << dt);
 			LOGWARN(3, "get_difficulty: can't calculate diff for block at height = " << tip->m_sidechainHeight << ", id = " << tip->m_sidechainId << ", mainchain height = " << tip->m_txinGenHeight);
-			return false;
+			return 2;
 		}
 
 		tmpTimestamps.emplace_back(static_cast<uint32_t>(dt));
@@ -1419,7 +1421,7 @@ bool SideChain::get_difficulty(const PoolBlock* const tip, std::vector<Difficult
 	}
 	tip->m_cachedNextDifficulty = curDifficulty;
 
-	return true;
+	return 0;
 }
 
 bool SideChain::p2pool_update_available() const
@@ -1699,6 +1701,15 @@ void SideChain::verify(PoolBlock* block)
 		return;
 	}
 
+	if (block->m_uncles.size() > MAX_UNCLES_PER_BLOCK) {
+		LOGWARN(3, "block at height = " << block->m_sidechainHeight <<
+			", id = " << block->m_sidechainId <<
+			", mainchain height = " << block->m_txinGenHeight << " has too many uncles (" << block->m_uncles.size() << ')');
+		block->m_verified = true;
+		block->m_invalid = true;
+		return;
+	}
+
 	// Uncle hashes must be sorted in the ascending order to prevent cheating when the same hash is repeated multiple times
 	for (size_t i = 1, n = block->m_uncles.size(); i < n; ++i) {
 		if (!(block->m_uncles[i - 1] < block->m_uncles[i])) {
@@ -1847,9 +1858,22 @@ void SideChain::verify(PoolBlock* block)
 		LOGINFO(6, "block " << block->m_sidechainId << " is built on top of the current chain tip, using current difficulty for verification");
 		diff = difficulty();
 	}
-	else if (!get_difficulty(parent, m_difficultyData, diff)) {
-		block->m_invalid = true;
-		return;
+	else {
+		const int err = get_difficulty(parent, m_difficultyData, diff);
+		if (err != 0) {
+			switch (err) {
+			// Parent/uncle or some other ancestor not found, verify it later
+			case 1:
+				block->m_verified = false;
+				return;
+
+			// Invalid timestamp or some other error
+			case 2:
+			default:
+				block->m_invalid = true;
+				return;
+			}
+		}
 	}
 
 	if (diff != block->m_difficulty) {
@@ -1974,7 +1998,7 @@ void SideChain::update_chain_tip(PoolBlock* block)
 	bool is_alternative;
 	if (is_longer_chain(tip, block, is_alternative)) {
 		difficulty_type diff;
-		if (get_difficulty(block, m_difficultyData, diff)) {
+		if (get_difficulty(block, m_difficultyData, diff) == 0) {
 			if (!m_chainTip.compare_exchange_strong(tip, block)) {
 				LOGINFO(5, "Trying to update an outdated chain tip. Ignoring it.");
 				return;
@@ -2661,6 +2685,12 @@ void SideChain::precalc_worker()
 	std::vector<std::pair<size_t, const Wallet*>> wallets;
 	wallets.reserve(m_chainWindowSize);
 
+	std::vector<std::pair<hash, size_t>> in;
+	std::vector<std::pair<hash, int32_t>> out;
+
+	std::vector<batch_public_key_input> in2;
+	std::vector<std::pair<hash, bool>> out2;
+
 	do {
 		const PoolBlock* job;
 
@@ -2701,12 +2731,29 @@ void SideChain::precalc_worker()
 			}
 		}
 
-		for (const std::pair<size_t, const Wallet*>& w : wallets) {
-			hash eph_public_key;
-			uint8_t view_tag;
-			if (!w.second->get_eph_public_key(job->m_txkeySec, w.first, eph_public_key, view_tag)) {
-				LOGWARN(6, "get_eph_public_key failed in precalc_worker");
-			}
+		const size_t n = wallets.size();
+
+		in.clear();
+		in.reserve(n);
+
+		for (size_t i = 0; i < n; ++i) {
+			in.emplace_back(wallets[i].second->view_public_key(), wallets[i].first);
+		}
+
+		if (!batch_derivations(in, job->m_txkeySec, out)) {
+			LOGWARN(6, "batch_derivations failed in precalc_worker");
+			continue;
+		}
+
+		in2.clear();
+		in2.reserve(n);
+
+		for (size_t i = 0; i < n; ++i) {
+			in2.emplace_back(out[i].first, wallets[i].first, wallets[i].second->spend_public_key());
+		}
+
+		if (!batch_public_keys(in2, out2)) {
+			LOGWARN(6, "batch_public_keys failed in precalc_worker");
 		}
 	} while (true);
 }
