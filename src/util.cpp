@@ -112,7 +112,7 @@ std::string p2pool_version()
 #endif
 #ifndef P2POOL_UNIT_TESTS
 		<< " - libcurl " << (curl_version_data ? curl_version_data->version : "unknown")
-		<< ", SSL library: " << (curl_version_data ? curl_version_data->ssl_version : "unknown") << '\n'
+		<< ", SSL library: " << (curl_version_data ? (curl_version_data->ssl_version ? curl_version_data->ssl_version : "none") : "unknown") << '\n'
 #endif
 		<< " - libuv " << uv_version_string() << '\n'
 		<< " - libzmq " << zmq_major << '.' << zmq_minor << '.' << zmq_patch << '\n'
@@ -768,6 +768,11 @@ bool is_private_address(const std::string& host)
 		return false;
 	}
 
+	return is_private_address(is_v6, addr);
+}
+
+bool is_private_address(bool is_v6, const raw_ip& addr)
+{
 	if (is_v6) {
 		const uint8_t a = addr.data[0];
 		const uint8_t b = addr.data[1];

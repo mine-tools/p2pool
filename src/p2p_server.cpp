@@ -897,6 +897,11 @@ void P2PServer::load_peer_list()
 			p.m_isV6 = is_v6;
 			p.normalize();
 
+			// Don't allow private IPs in peer lists
+			if (is_private_address(is_v6, p.m_addr)) {
+				return;
+			}
+
 			bool already_added = false;
 			for (const Peer& peer : m_peerList) {
 				if (peer.m_addr == p.m_addr) {
@@ -1010,6 +1015,11 @@ void P2PServer::load_monerod_peer_list()
 
 void P2PServer::update_peer_in_list(bool is_v6, const raw_ip& ip, int port)
 {
+	// Don't allow private IPs in peer lists
+	if (is_private_address(is_v6, ip)) {
+		return;
+	}
+
 	const uint64_t cur_time = seconds_since_epoch();
 
 	Peer peer{ is_v6, ip, port, 0, cur_time };
@@ -3376,6 +3386,11 @@ void P2PServer::P2PClient::on_peer_list_response(const uint8_t* buf)
 			is_v6 = false;
 		}
 
+		// Don't allow private IPs in peer lists
+		if (is_private_address(is_v6, ip)) {
+			continue;
+		}
+
 		if (!is_v6) {
 			const uint32_t b = ip.data[12];
 			if ((b == 0) || (b == 127) || (b >= 224)) {
@@ -3406,7 +3421,7 @@ void P2PServer::P2PClient::on_peer_list_response(const uint8_t* buf)
 
 					if (m_SoftwareID == SoftwareID::Unknown) {
 						LOGWARN(4, "peer " << log::Gray() << static_cast<char*>(m_addrString) << log::NoColor()
-							<< "runs an unknown software with id = " << log::Hex(id_value)
+							<< " runs an unknown software with id = " << log::Hex(id_value)
 						);
 					}
 
